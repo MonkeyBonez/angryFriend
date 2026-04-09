@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import SwiftData
 
 @main
 struct angryFriendApp: App {
@@ -13,5 +14,6 @@ struct angryFriendApp: App {
         WindowGroup {
             ContentView()
         }
+        .modelContainer(for: Friend.self)
     }
 }
