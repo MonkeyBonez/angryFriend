@@ -37,3 +37,5 @@ angryFriend/
 scripts/        Python tools for converting and testing the face model
 archive/        pre-rebuild scan pipeline, kept for reference
 ```
+
+See [IDEAS.md](IDEAS.md) for what's planned next.
