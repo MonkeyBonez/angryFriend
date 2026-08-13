@@ -8,120 +8,65 @@ import SwiftData
 @Observable
 @MainActor
 final class AppState {
-    var screen: AppScreen = .seedPicker
-    var seedImages: [UIImage] = []
+    var screen: AppScreen = .home
     var gameModel = GameModel()
-    var cardCount: Int = 9
-    var matchPool: [MatchedAsset] = []      // persists across rounds for current friend session
-    var usedAssetIDs: Set<String> = []     // tracks which pool photos have been used
-    var useZoomMode: Bool = false
-    var currentFriend: Friend? = nil       // set when loading a saved friend
+    var cardCount: Int = 12
+
+    var currentFriend: Friend? = nil       // the friend currently being played
+    var usedPhotoIDs: Set<String> = []     // photoMatches already used this session, so rounds vary
+
+    var pendingPhotoIDs: [String] = []     // freshly picked photo identifiers, awaiting identity discovery
+
+    var viewingFriend: Friend? = nil       // target for .friendDetail / .album, independent of gameplay
+    var isPickingCoverPhoto: Bool = false  // true when .album was opened to re-pick viewingFriend's cover
 }
 
 enum AppScreen {
-    case seedPicker
-    case scanning
+    case home
+    case processing
     case game
     case result
-    case debug
+    case friendDetail
+    case album
 }
 
 // MARK: - Root view
 
 struct ContentView: View {
     @State private var appState = AppState()
-    @Environment(\.modelContext) private var modelContext
-    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        Group {
-            switch appState.screen {
-            case .seedPicker:
-                SeedPickerView()
-            case .scanning:
-                ScanningView()
-            case .game:
-                GameView()
-            case .result:
-                ResultView()
-            case .debug:
-                DebugScanView()
-            }
-        }
-        .environment(appState)
-        .animation(.easeInOut(duration: 0.35), value: appState.screen == .seedPicker)
-        .onChange(of: scenePhase) { _, newPhase in
-            if newPhase == .active {
-                runBackgroundScanForSavedFriends()
-            }
-        }
-    }
+        ZStack {
+            // Keeps the sticker sheet behind every screen so cross-fades never
+            // flash the system background between two yellow rooms.
+            StickerTheme.sun.ignoresSafeArea()
 
-    // MARK: Feature 5: Background incremental scan on app open
-
-    private struct FriendScanSnapshot: Sendable {
-        let friendID: UUID
-        let seedImageData: [Data]
-        let matchedAssetIDs: [String]
-        let lastScannedAt: Date
-    }
-
-    private func runBackgroundScanForSavedFriends() {
-        let friends: [Friend]
-        do {
-            friends = try modelContext.fetch(FetchDescriptor<Friend>())
-        } catch { return }
-        guard !friends.isEmpty else { return }
-
-        // Extract Sendable snapshot before crossing actor boundary
-        let snapshots = friends.map {
-            FriendScanSnapshot(
-                friendID: $0.id,
-                seedImageData: $0.seedImageData,
-                matchedAssetIDs: $0.matchedAssetIDs,
-                lastScannedAt: $0.lastScannedAt
-            )
-        }
-
-        Task.detached(priority: .background) {
-            for snapshot in snapshots {
-                guard !Task.isCancelled else { return }
-                let newAssets = await PhotoLibraryService.shared.fetchAssets(since: snapshot.lastScannedAt)
-                guard !newAssets.isEmpty else { continue }
-
-                let seedImages = snapshot.seedImageData.compactMap { UIImage(data: $0) }
-                guard !seedImages.isEmpty else { continue }
-
-                let service: FaceMatchingService
-                do { service = try FaceMatchingService() } catch { continue }
-
-                let embeddings: [FaceEmbedding]
-                do { embeddings = try await service.extractSeedEmbeddings(from: seedImages) } catch { continue }
-
-                let newMatches = (try? await service.scanCameraRoll(
-                    seedEmbeddings: embeddings,
-                    assets: newAssets,
-                    matchCap: nil,
-                    onProgress: { _ in },
-                    onMatch: nil
-                )) ?? []
-
-                let newIDs = newMatches.map { $0.asset.localIdentifier }
-                let existingSet = Set(snapshot.matchedAssetIDs)
-                let dedupedNew = newIDs.filter { !existingSet.contains($0) }
-                guard !dedupedNew.isEmpty else { continue }
-
-                let fid = snapshot.friendID
-                await MainActor.run { [dedupedNew] in
-                    let descriptor = FetchDescriptor<Friend>(predicate: #Predicate { $0.id == fid })
-                    if let friend = try? self.modelContext.fetch(descriptor).first {
-                        friend.matchedAssetIDs.append(contentsOf: dedupedNew)
-                        friend.lastScannedAt = Date()
-                        try? self.modelContext.save()
-                    }
+            Group {
+                switch appState.screen {
+                case .home:
+                    HomeView()
+                case .processing:
+                    ProcessingView()
+                case .game:
+                    GameView()
+                case .result:
+                    ResultView()
+                case .friendDetail:
+                    FriendDetailView()
+                case .album:
+                    FriendAlbumView()
                 }
             }
+            .transition(.asymmetric(
+                insertion: .scale(scale: 0.94).combined(with: .opacity),
+                removal: .scale(scale: 1.04).combined(with: .opacity)
+            ))
         }
+        .environment(appState)
+        .animation(.spring(response: 0.38, dampingFraction: 0.85), value: appState.screen)
+        // The identity commits to the yellow sheet, so system chrome (alerts,
+        // dialogs, the photo picker) stays light regardless of device setting.
+        .preferredColorScheme(.light)
     }
 }
 

@@ -9,10 +9,12 @@ struct SeedPickerView: View {
     @Query(sort: \Friend.lastScannedAt, order: .reverse) private var savedFriends: [Friend]
 
     @State private var showPicker = false
+    @State private var showMultiPicker = false
     @State private var permissionDenied = false
     @State private var pendingFaceCrops: [(crop: UIImage, normalizedBox: CGRect)] = []
     @State private var showFacePicker = false
     @State private var showNoFaceAlert = false
+    @State private var manualPickAlert: String? = nil
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -100,39 +102,41 @@ struct SeedPickerView: View {
                     }
                     .padding(.horizontal, 32)
 
+                    VStack(spacing: 4) {
+                        Button(action: requestAndPickManual) {
+                            Label("Pick Photos Yourself", systemImage: "person.2.crop.square.stack")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                                .padding()
+                                .background(Color(.secondarySystemFill))
+                                .foregroundStyle(.primary)
+                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                        }
+
+                        Text("Choose from your People album in Photos — no scanning needed.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(.horizontal, 32)
+
+                    HStack {
+                        Text("Cards in game")
+                            .font(.subheadline.weight(.medium))
+                        Spacer()
+                        Picker("Cards", selection: Binding(
+                            get: { appState.cardCount },
+                            set: { appState.cardCount = $0 }
+                        )) {
+                            Text("9").tag(9)
+                            Text("12").tag(12)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 160)
+                    }
+                    .padding(.horizontal, 32)
+
                     if !appState.seedImages.isEmpty {
-                        HStack {
-                            Text("Cards in game")
-                                .font(.subheadline.weight(.medium))
-                            Spacer()
-                            Picker("Cards", selection: Binding(
-                                get: { appState.cardCount },
-                                set: { appState.cardCount = $0 }
-                            )) {
-                                Text("9").tag(9)
-                                Text("12").tag(12)
-                            }
-                            .pickerStyle(.segmented)
-                            .frame(width: 160)
-                        }
-                        .padding(.horizontal, 32)
-
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Zoom to face")
-                                    .font(.subheadline.weight(.medium))
-                                Text("Extract only the matched person in group shots")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Toggle("", isOn: Binding(
-                                get: { appState.useZoomMode },
-                                set: { appState.useZoomMode = $0 }
-                            ))
-                        }
-                        .padding(.horizontal, 32)
-
                         Button(action: { appState.screen = .scanning }) {
                             Text("Scan Camera Roll")
                                 .font(.headline)
@@ -153,6 +157,19 @@ struct SeedPickerView: View {
             ImagePicker { image in
                 handlePickedImage(image)
             }
+        }
+        .sheet(isPresented: $showMultiPicker) {
+            MultiImagePicker { assetIdentifiers in
+                handlePickedAssets(assetIdentifiers)
+            }
+        }
+        .alert("Can't Start Game", isPresented: Binding(
+            get: { manualPickAlert != nil },
+            set: { if !$0 { manualPickAlert = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(manualPickAlert ?? "")
         }
         .sheet(isPresented: $showFacePicker) {
             FacePickerView(
@@ -195,11 +212,7 @@ struct SeedPickerView: View {
 
     private func loadSavedFriend(_ friend: Friend) {
         appState.seedImages = friend.seedImageData.compactMap { UIImage(data: $0) }
-        appState.useZoomMode = friend.useZoomMode
         appState.currentFriend = friend
-
-        friend.lastScannedAt = Date()
-        try? modelContext.save()
 
         let assets = PHAsset.fetchAssets(
             withLocalIdentifiers: friend.matchedAssetIDs,
@@ -238,6 +251,45 @@ struct SeedPickerView: View {
             }
         }
     }
+
+    private func requestAndPickManual() {
+        Task {
+            let status = await PhotoLibraryService.shared.requestAuthorization()
+            if status == .authorized || status == .limited {
+                permissionDenied = false
+                showMultiPicker = true
+            } else {
+                permissionDenied = true
+            }
+        }
+    }
+
+    // MARK: - Manual pick (People album alternative to scanning)
+
+    private func handlePickedAssets(_ identifiers: [String]) {
+        guard !identifiers.isEmpty else { return }
+
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
+        var pool: [MatchedAsset] = []
+        fetched.enumerateObjects { asset, _, _ in
+            pool.append(MatchedAsset(asset: asset, similarity: 1.0, faceBoundingBox: .zero))
+        }
+
+        guard pool.count >= appState.cardCount else {
+            if pool.count < identifiers.count {
+                manualPickAlert = "Only \(pool.count) of \(identifiers.count) photos could be loaded — allow full photo access in Settings, then try again."
+            } else {
+                manualPickAlert = "You picked \(pool.count) photo\(pool.count == 1 ? "" : "s") — pick at least \(appState.cardCount) photos of your friend."
+            }
+            return
+        }
+
+        appState.seedImages = []
+        appState.currentFriend = nil
+        appState.matchPool = pool.shuffled()
+        appState.usedAssetIDs = []
+        appState.screen = .scanning
+    }
 }
 
 // MARK: - PHPicker wrapper (single selection)
@@ -274,6 +326,41 @@ struct ImagePicker: UIViewControllerRepresentable {
                     }
                 }
             }
+        }
+    }
+}
+
+// MARK: - PHPicker wrapper (multi selection, returns asset identifiers)
+
+/// The user navigates to Albums → People & Pets inside the picker themselves — Apple's
+/// face clusters have no public API, so this out-of-process picker is the only way to
+/// leverage them. photoLibrary-based config is required for non-nil assetIdentifiers.
+struct MultiImagePicker: UIViewControllerRepresentable {
+    let completion: @MainActor ([String]) -> Void
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var config = PHPickerConfiguration(photoLibrary: .shared())
+        config.filter = .images
+        config.selectionLimit = 0
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(completion: completion) }
+
+    @MainActor
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        let completion: @MainActor ([String]) -> Void
+        init(completion: @escaping @MainActor ([String]) -> Void) { self.completion = completion }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            picker.dismiss(animated: true)
+            let identifiers = results.compactMap(\.assetIdentifier)
+            guard !identifiers.isEmpty else { return }
+            completion(identifiers)
         }
     }
 }

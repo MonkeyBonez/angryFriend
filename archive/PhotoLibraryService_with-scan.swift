@@ -36,6 +36,31 @@ actor PhotoLibraryService {
         await PHPhotoLibrary.requestAuthorization(for: .readWrite)
     }
 
+    func fetchAssets(since date: Date) -> [PHAsset] {
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.predicate = NSPredicate(
+            format: "mediaType == %d AND creationDate > %@",
+            PHAssetMediaType.image.rawValue, date as CVarArg
+        )
+        let result = PHAsset.fetchAssets(with: .image, options: options)
+        var assets: [PHAsset] = []
+        assets.reserveCapacity(result.count)
+        result.enumerateObjects { asset, _, _ in assets.append(asset) }
+        return assets
+    }
+
+    func fetchAllCameraRollAssets() -> [PHAsset] {
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+        let result = PHAsset.fetchAssets(with: .image, options: options)
+        var assets: [PHAsset] = []
+        assets.reserveCapacity(result.count)
+        result.enumerateObjects { asset, _, _ in assets.append(asset) }
+        return assets
+    }
+
     /// Nonisolated so multiple callers can request images concurrently.
     /// Every call has an internal timeout — after `timeoutSeconds` we abandon the
     /// PHImageManager request and return nil. This prevents stuck iCloud assets from

@@ -1048,24 +1048,35 @@ def run_expansion_mode(args, coreml: CoreMLModel, det: FaceDetector):
     if not initial_pool:
         print("ERROR: no seed embeddings"); return
 
-    # --- Pre-embed all photos (this is the expensive step, done once) ---
-    print(f"\n[Expansion] Pre-embedding {len(pos_list)} positives + {len(neg_list)} negatives…")
-    pos_embedded: list[tuple[str, np.ndarray | None]] = []
-    neg_embedded: list[tuple[str, np.ndarray | None]] = []
+    # --- Pre-embed all photos: ALL faces per photo, computed once ---
+    # Group shots contain multiple faces. Embedding only the largest face (the old
+    # behaviour) could seed the pool with a stranger from a group positive, which then
+    # boosts strangers in the negatives → false positives. We keep every face and both
+    # match and expand on the best-MATCHING face, exactly like the Swift scan.
+    print(f"\n[Expansion] Pre-embedding {len(pos_list)} positives + {len(neg_list)} negatives (all faces)…")
+    pos_embedded: list[tuple[str, list[np.ndarray]]] = []
+    neg_embedded: list[tuple[str, list[np.ndarray]]] = []
 
     for path, img in pos_list:
-        emb = full_fixed_with_embedding(img, det, coreml)
-        pos_embedded.append((path, emb))
+        pos_embedded.append((path, full_fixed_all_faces(img, det, coreml)))
     for path, img in neg_list:
-        emb = full_fixed_with_embedding(img, det, coreml)
-        neg_embedded.append((path, emb))
+        neg_embedded.append((path, full_fixed_all_faces(img, det, coreml)))
 
-    pos_detectable = [(p, e) for p, e in pos_embedded if e is not None]
-    neg_detectable = [(p, e) for p, e in neg_embedded if e is not None]
-    pos_no_face    = [p for p, e in pos_embedded if e is None]
-    neg_no_face    = [p for p, e in neg_embedded if e is None]
+    pos_detectable = [(p, e) for p, e in pos_embedded if e]
+    neg_detectable = [(p, e) for p, e in neg_embedded if e]
+    pos_no_face    = [p for p, e in pos_embedded if not e]
+    neg_no_face    = [p for p, e in neg_embedded if not e]
     print(f"  positives with face: {len(pos_detectable)}/{len(pos_list)}")
     print(f"  negatives with face: {len(neg_detectable)}/{len(neg_list)}")
+
+    def photo_best(face_embs: list[np.ndarray], pool: list[np.ndarray]) -> "tuple[float, np.ndarray | None]":
+        """Best-matching face in a photo vs the pool → (score, that face's embedding)."""
+        best_score, best_emb = float("-inf"), None
+        for emb in face_embs:
+            sim = max_sim_to_pool(emb, pool)
+            if sim > best_score:
+                best_score, best_emb = sim, emb
+        return best_score, best_emb
 
     # Parameters from args
     expansion_threshold: float = args.expansion_threshold
@@ -1100,14 +1111,8 @@ def run_expansion_mode(args, coreml: CoreMLModel, det: FaceDetector):
     for cfg_et, cfg_me, cfg_div, cfg_order in configs:
 
         # --- Baseline (no expansion, single pass) ---
-        baseline_pos_scores = []
-        baseline_neg_scores = []
-        for _, emb in pos_detectable:
-            sim = max_sim_to_pool(emb, initial_pool)
-            baseline_pos_scores.append(sim)
-        for _, emb in neg_detectable:
-            sim = max_sim_to_pool(emb, initial_pool)
-            baseline_neg_scores.append(sim)
+        baseline_pos_scores = [photo_best(embs, initial_pool)[0] for _, embs in pos_detectable]
+        baseline_neg_scores = [photo_best(embs, initial_pool)[0] for _, embs in neg_detectable]
 
         baseline_tp  = sum(1 for s in baseline_pos_scores if s >= match_threshold)
         baseline_fp  = sum(1 for s in baseline_neg_scores if s >= match_threshold)
@@ -1121,10 +1126,10 @@ def run_expansion_mode(args, coreml: CoreMLModel, det: FaceDetector):
 
         # Determine scan order for positives (we only expand from positives)
         if cfg_order == "conf_desc":
-            # Sort positives by descending similarity to seed before scanning,
+            # Sort positives by descending best-face similarity to seed before scanning,
             # so high-confidence matches expand the pool first.
             ordered_pos = sorted(pos_detectable,
-                                 key=lambda pe: max_sim_to_pool(pe[1], initial_pool),
+                                 key=lambda pe: photo_best(pe[1], initial_pool)[0],
                                  reverse=True)
         elif cfg_order == "random":
             ordered_pos = list(pos_detectable)
@@ -1133,31 +1138,21 @@ def run_expansion_mode(args, coreml: CoreMLModel, det: FaceDetector):
             ordered_pos = list(pos_detectable)
 
         expanded_count = 0
-        expansion_pos_scores = {}   # path → final score (after full pool)
 
-        # First pass: sequential scan, expanding pool as we go
-        for path, emb in ordered_pos:
-            sim = max_sim_to_pool(emb, pool)
-            expansion_pos_scores[path] = sim
-            # Expand?
+        # First pass: sequential scan, expanding the pool with the best-MATCHING face
+        # of each confident positive (not the largest face).
+        for path, embs in ordered_pos:
+            sim, best_emb = photo_best(embs, pool)
             remaining_slots = cfg_me - expanded_count
-            if remaining_slots > 0 and sim >= cfg_et:
-                if is_diverse_enough(emb, pool, cfg_div):
-                    pool.append(emb)
+            if remaining_slots > 0 and sim >= cfg_et and best_emb is not None:
+                if is_diverse_enough(best_emb, pool, cfg_div):
+                    pool.append(best_emb)
                     expanded_count += 1
 
-        # Second pass: re-score positives with the fully-expanded pool
-        # (so even early-scanned photos benefit from later-added seeds)
-        final_pos_scores = []
-        for path, emb in pos_detectable:
-            sim = max_sim_to_pool(emb, pool)
-            final_pos_scores.append(sim)
-
-        # Score negatives with final pool
-        final_neg_scores = []
-        for path, emb in neg_detectable:
-            sim = max_sim_to_pool(emb, pool)
-            final_neg_scores.append(sim)
+        # Second pass: re-score with the fully-expanded pool (so even early-scanned
+        # photos benefit from later-added seeds). Score = best face vs final pool.
+        final_pos_scores = [photo_best(embs, pool)[0] for _, embs in pos_detectable]
+        final_neg_scores = [photo_best(embs, pool)[0] for _, embs in neg_detectable]
 
         exp_tp  = sum(1 for s in final_pos_scores if s >= match_threshold)
         exp_fp  = sum(1 for s in final_neg_scores if s >= match_threshold)
@@ -1185,7 +1180,7 @@ def run_expansion_mode(args, coreml: CoreMLModel, det: FaceDetector):
 
         # Show which positives were newly found by expansion
         newly_found = []
-        for (path, emb), base_sim, exp_sim in zip(
+        for (path, _embs), base_sim, exp_sim in zip(
                 pos_detectable, baseline_pos_scores, final_pos_scores):
             was_tp = base_sim >= match_threshold
             now_tp = exp_sim >= match_threshold
@@ -1200,7 +1195,7 @@ def run_expansion_mode(args, coreml: CoreMLModel, det: FaceDetector):
 
         # Show any new false positives
         new_fps = []
-        for (path, emb), base_sim, exp_sim in zip(
+        for (path, _embs), base_sim, exp_sim in zip(
                 neg_detectable, baseline_neg_scores, final_neg_scores):
             was_fp = base_sim >= match_threshold
             now_fp = exp_sim >= match_threshold

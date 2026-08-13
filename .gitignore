@@ -44,3 +44,9 @@ venv/
 .env
 *.pem
 secrets.*
+
+# Test photo sets (personal photos) and generated test artifacts — keep out of git
+PhotosOfFriends/
+PhotosOfRandoms/
+test_data/
+debug_chips/
