@@ -19,21 +19,17 @@ struct ResultView: View {
         return name.isEmpty ? "Your friend" : name
     }
 
+    private var isDemo: Bool { appState.isDemoRound }
+
+    private var verdict: String {
+        isDemo
+            ? "That's the whole game. Now imagine that face is your friend's."
+            : "\(friendName) is FURIOUS. You lose this round."
+    }
+
     var body: some View {
         ZStack {
-            // Heat blast behind the sticker sheet — the room is on fire.
-            RadialGradient(
-                colors: [
-                    Color(red: 1.00, green: 0.612, blue: 0.420),
-                    StickerTheme.sun,
-                ],
-                center: UnitPoint(x: 0.5, y: 0.38),
-                startRadius: 10,
-                endRadius: 420
-            )
-            .ignoresSafeArea()
-
-            ConfettiSheet(count: 20, opacity: 0.4, seed: 59).ignoresSafeArea()
+            // Heat gradient and dots come from ContentView.
 
             VStack(spacing: 0) {
                 Spacer(minLength: 12)
@@ -48,7 +44,7 @@ struct ResultView: View {
                     .opacity(titleIn ? 1 : 0)
                     .padding(.top, 4)
 
-                Text("\(friendName) is FURIOUS. You lose this round.")
+                Text(verdict)
                     .font(.sticker(13.5, .bold))
                     .foregroundStyle(StickerTheme.ink)
                     .multilineTextAlignment(.center)
@@ -57,10 +53,19 @@ struct ResultView: View {
                     .opacity(titleIn ? 1 : 0)
 
                 if let card = losingCard {
-                    Image(uiImage: card.image)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 152, height: 152)
+                    Group {
+                        if isDemo {
+                            // The emoji pal drops the disguise.
+                            Text("😡")
+                                .font(.system(size: 96))
+                                .frame(width: 152, height: 152)
+                        } else {
+                            Image(uiImage: card.image)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 152, height: 152)
+                        }
+                    }
                         .background(StickerTheme.tile(1))
                         .clipShape(RoundedRectangle(cornerRadius: 20))
                         .overlay(RoundedRectangle(cornerRadius: 20).stroke(StickerTheme.flame, lineWidth: 4))
@@ -79,18 +84,41 @@ struct ResultView: View {
                 Spacer(minLength: 20)
 
                 VStack(spacing: 14) {
-                    Button(action: playAgain) {
-                        Label("Play Again", systemImage: "arrow.clockwise")
-                    }
-                    .buttonStyle(StickerButtonStyle(background: StickerTheme.flame))
+                    if isDemo {
+                        // The demo's job is done: point at the real thing, keep
+                        // another emoji round as the quiet second option.
+                        Button(action: addRealFriend) {
+                            Label("Add a Friend's Photos", systemImage: "photo.stack.fill")
+                        }
+                        .buttonStyle(StickerButtonStyle(background: StickerTheme.pink))
 
-                    Button(action: startOver) {
-                        Text("pick a different friend")
-                            .font(.sticker(12.5, .bold))
-                            .foregroundStyle(StickerTheme.ink.opacity(0.75))
-                            .underline()
+                        HStack(spacing: 14) {
+                            Button(action: playAgain) {
+                                Text("another emoji round")
+                            }
+                            Text("·").foregroundStyle(StickerTheme.ink.opacity(0.4))
+                            Button(action: startOver) {
+                                Text("back to menu")
+                            }
+                        }
+                        .font(.sticker(12.5, .bold))
+                        .foregroundStyle(StickerTheme.ink.opacity(0.75))
+                        .underline()
+                        .buttonStyle(.plain)
+                    } else {
+                        Button(action: playAgain) {
+                            Label("Play Again", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(StickerButtonStyle(background: StickerTheme.flame))
+
+                        Button(action: startOver) {
+                            Text("pick a different friend")
+                                .font(.sticker(12.5, .bold))
+                                .foregroundStyle(StickerTheme.ink.opacity(0.75))
+                                .underline()
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 30)
                 .padding(.bottom, 24)
@@ -125,7 +153,11 @@ struct ResultView: View {
 
     private func playAgain() {
         Haptics.press()
-        appState.screen = .processing
+        if isDemo {
+            appState.startDemoRound()
+        } else {
+            appState.screen = .processing
+        }
     }
 
     private func startOver() {
@@ -134,6 +166,12 @@ struct ResultView: View {
         appState.pendingPhotoIDs = []
         appState.usedPhotoIDs = []
         appState.currentFriend = nil
+        appState.isDemoRound = false
         appState.screen = .home
+    }
+
+    private func addRealFriend() {
+        appState.pendingAddFriend = true
+        startOver()
     }
 }

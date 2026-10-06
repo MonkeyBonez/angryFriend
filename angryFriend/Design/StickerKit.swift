@@ -182,31 +182,91 @@ struct TapeLabel: View {
 
 // MARK: - Backdrop
 
-/// Scattered confetti dots behind the yellow. Drawn once into a Canvas from a
-/// seeded sequence so the sheet looks hand-scattered but never reshuffles.
+/// How the confetti moves on a screen: how far each dot wanders (points) and how
+/// much it swells, with the period of each in seconds.
+struct ConfettiMotion: Equatable {
+    var drift: Double
+    var driftPeriod: Double
+    var grow: Double
+    var growPeriod: Double
+
+    /// Home and the result screen — the party is on.
+    static let lively = ConfettiMotion(drift: 14, driftPeriod: 3, grow: 0.45, growPeriod: 1.4)
+    /// In the game and while working — ambience, not weather.
+    static let calm = ConfettiMotion(drift: 5, driftPeriod: 9, grow: 0.15, growPeriod: 4)
+    static let still = ConfettiMotion(drift: 0, driftPeriod: 9, grow: 0, growPeriod: 4)
+}
+
+/// The running state of the dots. Screens share the one on `AppState` so the
+/// scatter keeps moving through a screen change instead of starting over, and a
+/// new motion is eased into rather than snapped to.
+final class ConfettiClock {
+    private(set) var drift = 0.0
+    private(set) var grow = 0.0
+    private(set) var phase = 0.0
+    private(set) var growPhase = 0.0
+    private var driftRate = 0.0
+    private var growRate = 0.0
+    private var last: Date?
+
+    func advance(to now: Date, toward motion: ConfettiMotion) {
+        // Capped so a return from the background doesn't fling every dot.
+        let dt = last.map { min(0.1, max(0, now.timeIntervalSince($0))) } ?? 0
+        last = now
+        let ease = 1 - exp(-dt / 0.8)
+        driftRate += (2 * .pi / motion.driftPeriod - driftRate) * ease
+        growRate += (2 * .pi / motion.growPeriod - growRate) * ease
+        drift += (motion.drift - drift) * ease
+        grow += (motion.grow - grow) * ease
+        phase += driftRate * dt
+        growPhase += growRate * dt
+    }
+}
+
+/// Scattered confetti dots behind the yellow, placed from a seeded sequence so
+/// the sheet looks hand-scattered but never reshuffles. Every screen uses the
+/// same count and seed, so the dots are the same dots from one screen to the next.
 struct ConfettiSheet: View {
-    var count: Int = 26
+    var motion: ConfettiMotion = .still
     var opacity: Double = 0.55
-    var seed: UInt64 = 7
+    var clock: ConfettiClock? = nil
+    var count: Int = 30
+    var seed: UInt64 = 11
+
+    @State private var ownClock = ConfettiClock()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let palette = [StickerTheme.pink, StickerTheme.blue, Color.white, StickerTheme.mint]
         let dots = Self.scatter(count: count, seed: seed)
+        let clock = clock ?? ownClock
 
-        Canvas { context, size in
-            for dot in dots {
-                let radius = dot.radius
-                let rect = CGRect(
-                    x: dot.x * size.width - radius,
-                    y: dot.y * size.height - radius,
-                    width: radius * 2,
-                    height: radius * 2
-                )
-                context.fill(Ellipse().path(in: rect), with: .color(palette[dot.color]))
+        Group {
+            if reduceMotion {
+                sheet(dots, clock: clock, now: nil)
+            } else {
+                TimelineView(.animation) { timeline in
+                    sheet(dots, clock: clock, now: timeline.date)
+                }
             }
         }
         .opacity(opacity)
         .allowsHitTesting(false)
+    }
+
+    private func sheet(_ dots: [Dot], clock: ConfettiClock, now: Date?) -> some View {
+        let palette = [StickerTheme.pink, StickerTheme.blue, Color.white, StickerTheme.mint]
+        return Canvas { context, size in
+            if let now { clock.advance(to: now, toward: motion) }
+            for (i, dot) in dots.enumerated() {
+                // A per-dot offset so the sheet shimmers rather than sways as one.
+                let offset = Double(i) * 0.9
+                let x = dot.x * size.width + clock.drift * sin(clock.phase + offset)
+                let y = dot.y * size.height + clock.drift * 0.7 * cos(clock.phase * 0.8 + offset * 1.3)
+                let radius = max(0.4, dot.radius * (1 + clock.grow * sin(clock.growPhase + offset)))
+                let rect = CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2)
+                context.fill(Ellipse().path(in: rect), with: .color(palette[dot.color]))
+            }
+        }
     }
 
     private struct Dot {

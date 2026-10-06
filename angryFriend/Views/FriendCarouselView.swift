@@ -10,6 +10,7 @@ struct FriendCarouselView: View {
     let onHold: (Friend) -> Void
     let onEdit: (Friend) -> Void
     let onAddNew: () -> Void
+    let onDemo: () -> Void
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -27,6 +28,11 @@ struct FriendCarouselView: View {
                     )
                     .popIn(delay: 0.1 + Double(index) * 0.06)
                 }
+
+                // The emoji pal never leaves the line-up — a practice round is
+                // always one tap away, even with a full roster.
+                EmojiPalSticker(index: friends.count, action: onDemo)
+                    .popIn(delay: 0.1 + Double(friends.count) * 0.06)
             }
             .padding(.horizontal, 28)
             .padding(.vertical, 10)
@@ -107,6 +113,49 @@ private struct FriendSticker: View {
 
     private var displayName: String {
         friend.name.isEmpty ? "Friend" : friend.name
+    }
+}
+
+// MARK: - Emoji pal
+
+/// The stand-in friend: tap to deal a practice round of emoji faces. Dressed like
+/// a real friend sticker so it reads as one of the suspects, with a blue tape
+/// label so nobody mistakes it for someone they added.
+struct EmojiPalSticker: View {
+    var index: Int = 0
+    var size: CGFloat = 78
+    let action: () -> Void
+
+    @State private var punch = false
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Text(EmojiDeck.mascot)
+                .font(.system(size: size * 0.56))
+                .frame(width: size, height: size)
+                .background(StickerTheme.tile(index))
+                .clipShape(Circle())
+                .overlay(Circle().stroke(.white, lineWidth: 3.5))
+                .overlay(Circle().stroke(StickerTheme.ink, lineWidth: 2).padding(-3.5))
+                .hardShadow(StickerTheme.ink.opacity(0.35), x: 3, y: 4)
+                .rotationEffect(.degrees(StickerTheme.lean(index)))
+                .scaleEffect(punch ? 0.86 : 1)
+                .contentShape(Circle())
+                .onTapGesture {
+                    Haptics.peel()
+                    withAnimation(.spring(response: 0.16, dampingFraction: 0.5)) { punch = true }
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.5).delay(0.12)) { punch = false }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { action() }
+                }
+
+            TapeLabel(text: "Emoji Pal", tilt: StickerTheme.lean(index + 3),
+                      background: StickerTheme.blue, foreground: .white)
+        }
+        .frame(width: size + 8)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Emoji Pal")
+        .accessibilityHint("Tap to play a practice round with emoji faces")
+        .accessibilityAddTraits(.isButton)
     }
 }
 

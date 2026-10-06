@@ -5,7 +5,7 @@ import Photos
 struct GameCard: Identifiable {
     let id = UUID()
     let image: UIImage
-    let isAngry: Bool
+    var isAngry: Bool
     var isTapped = false
 }
 
@@ -18,8 +18,14 @@ final class GameModel {
     var losingIndex: Int? = nil
     var currentTurn = 1
 
-    func setup(from cards: [GameCard]) {
+    /// When set, no card is angry up front: the angry one is chosen at tap time,
+    /// never before this tap number, and uniformly among whatever's left — so a
+    /// demo round always lets a few people play before the reveal.
+    private var earliestAngryTap: Int? = nil
+
+    func setup(from cards: [GameCard], earliestAngryTap: Int? = nil) {
         self.cards = cards
+        self.earliestAngryTap = earliestAngryTap
         tappedIndices = []
         gameOver = false
         losingIndex = nil
@@ -28,6 +34,13 @@ final class GameModel {
 
     func tap(index: Int) {
         guard !gameOver, !tappedIndices.contains(index) else { return }
+        if let earliestAngryTap {
+            let tapNumber = tappedIndices.count + 1
+            let remaining = cards.count - tappedIndices.count
+            // 1-in-remaining keeps the odds the same as a pre-placed angry card;
+            // the last card left is always it.
+            cards[index].isAngry = tapNumber >= earliestAngryTap && Int.random(in: 0..<remaining) == 0
+        }
         tappedIndices.insert(index)
         cards[index].isTapped = true
         if cards[index].isAngry {

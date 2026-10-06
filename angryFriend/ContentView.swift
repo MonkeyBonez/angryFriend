@@ -19,6 +19,24 @@ final class AppState {
 
     var viewingFriend: Friend? = nil       // target for .friendDetail / .album, independent of gameplay
     var isPickingCoverPhoto: Bool = false  // true when .album was opened to re-pick viewingFriend's cover
+
+    var isDemoRound: Bool = false          // the cards on the table are emoji, not a friend
+    var pendingAddFriend: Bool = false     // Home should open the add-friend flow as soon as it appears
+
+    let rescanner = FriendRescanner()      // finds new photos of the friend being played, in the background
+    let confetti = ConfettiClock()         // one clock so the background dots carry on across screens
+
+    /// Deals a grid of emoji faces and goes straight to the table — there's
+    /// nothing to identify or cut out, so `.processing` is skipped.
+    func startDemoRound() {
+        currentFriend = nil
+        usedPhotoIDs = []
+        pendingPhotoIDs = []
+        isDemoRound = true
+        gameModel.setup(from: EmojiDeck.deal(count: cardCount),
+                        earliestAngryTap: EmojiDeck.safeOpeningTaps + 1)
+        screen = .game
+    }
 }
 
 enum AppScreen {
@@ -40,6 +58,24 @@ struct ContentView: View {
             // Keeps the sticker sheet behind every screen so cross-fades never
             // flash the system background between two yellow rooms.
             StickerTheme.sun.ignoresSafeArea()
+
+            // Heat blast behind the result — the room is on fire.
+            if appState.screen == .result {
+                RadialGradient(
+                    colors: [Color(red: 1.00, green: 0.612, blue: 0.420), StickerTheme.sun],
+                    center: UnitPoint(x: 0.5, y: 0.38),
+                    startRadius: 10,
+                    endRadius: 420
+                )
+                .ignoresSafeArea()
+                .transition(.opacity)
+            }
+
+            // One sheet of dots under every screen, outside the screen transition,
+            // so they stay put while the rooms cross-fade over them. Which way they
+            // move is decided here, by screen: lively everywhere, calm at the table.
+            ConfettiSheet(motion: confettiMotion, opacity: confettiOpacity, clock: appState.confetti)
+                .ignoresSafeArea()
 
             Group {
                 switch appState.screen {
@@ -67,6 +103,21 @@ struct ContentView: View {
         // The identity commits to the yellow sheet, so system chrome (alerts,
         // dialogs, the photo picker) stays light regardless of device setting.
         .preferredColorScheme(.light)
+    }
+
+    private var confettiMotion: ConfettiMotion {
+        appState.screen == .game ? .calm : .lively
+    }
+
+    private var confettiOpacity: Double {
+        switch appState.screen {
+        case .home: return 0.55
+        case .processing: return 0.45
+        case .game: return 0.35
+        case .result: return 0.4
+        case .friendDetail: return 0.4
+        case .album: return 0
+        }
     }
 }
 

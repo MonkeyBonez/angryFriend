@@ -23,18 +23,23 @@ struct GameView: View {
 
     var body: some View {
         ZStack {
-            StickerTheme.sun.ignoresSafeArea()
-            ConfettiSheet(count: 18, opacity: 0.35, seed: 41).ignoresSafeArea()
+            // Background sheet and dots come from ContentView.
 
             VStack(spacing: 0) {
                 topBar
                     .padding(.horizontal, 16)
                     .padding(.top, 6)
 
-                Text("don't pick the angry one 👀")
-                    .font(.sticker(14.5, .heavy))
-                    .foregroundStyle(StickerTheme.ink)
-                    .padding(.top, 10)
+                HStack(spacing: 8) {
+                    if appState.isDemoRound {
+                        TapeLabel(text: "DEMO", tilt: -3, size: 10,
+                                  background: StickerTheme.blue, foreground: .white)
+                    }
+                    Text("don't pick the angry one 👀")
+                        .font(.sticker(14.5, .heavy))
+                        .foregroundStyle(StickerTheme.ink)
+                }
+                .padding(.top, 10)
 
                 Spacer(minLength: 8)
 
@@ -46,12 +51,7 @@ struct GameView: View {
                 }
                 .padding(.horizontal, 16)
 
-                Spacer(minLength: 8)
-
-                Text("pass the phone after every tap")
-                    .font(.sticker(11, .medium))
-                    .foregroundStyle(StickerTheme.ink.opacity(0.6))
-                    .padding(.bottom, 10)
+                Spacer(minLength: 32)
             }
 
             // The whole room flashes when the angry card turns up.
@@ -121,6 +121,7 @@ struct GameView: View {
         appState.pendingPhotoIDs = []
         appState.usedPhotoIDs = []
         appState.currentFriend = nil
+        appState.isDemoRound = false
         appState.screen = .home
     }
 }

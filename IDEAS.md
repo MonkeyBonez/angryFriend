@@ -5,67 +5,25 @@ Not ordered by priority.
 
 ---
 
-## Emoji demo mode
-
-Let someone play a full round without adding a friend first. If they have no
-saved friends — or don't want to hand over their photo library yet — deal a grid
-of emoji faces instead of cutouts. One is still secretly angry.
-
-**Why:** Right now the app is a locked door. You cannot see the game until
-you've picked photos and waited through identity discovery, which is a lot of
-faith to ask for before you know whether the game is fun. A demo round is the
-fastest possible answer to "what is this?", and it doubles as onboarding — you
-learn the rules by playing rather than by reading them.
-
-It also covers a real dead end: someone with no usable photos of any one person
-currently gets an error and nothing to do.
-
-**Where to start:** This was prototyped during the reskin and worked well. The
-cards are ordinary `GameCard`s, so nothing in `GameModel` or `GameView` needs to
-change — only the image source. Render each emoji into a `UIImage` with
-`UIGraphicsImageRenderer`, drawing the emoji as an `NSString` at ~190pt into a
-300×300 canvas, then build cards exactly the way `ProcessingView.setupGame` does.
-Entry point would be a "Try a demo round" button on `HomeView`'s empty state,
-skipping `.processing` entirely and going straight to `.game`.
-
-Open question: after the demo ends, the result screen's "Play Again" should
-probably nudge toward adding a real friend rather than dealing more emoji.
-
----
 
 ## Onboarding / how-to-play screen
 
 A first-run screen covering the two things people won't guess: how the game is
 played, and how to add friends well.
 
-**Why:** Two rules currently live only as small captions in the UI — that you
-pass the phone after every tap, and that picking from the People album in Photos
-gives much better results. Both are load-bearing, and a caption under a button is
-not where someone looks before their first game.
+**Why:** Two rules aren't taught anywhere that works — that you pass the phone
+after every tap (no longer shown at all), and that picking from the People album
+in Photos gives much better results (a small caption under the add button). Both
+are load-bearing, and a caption is not where someone looks before their first game.
 
 **Where to start:** New view built from `Design/StickerKit.swift` primitives, shown
 from `ContentView` when no friends exist and a "seen onboarding" flag is unset.
 Use emoji to illustrate the rules so it doesn't need custom art. Pairs naturally
-with the emoji demo above — the last onboarding step could *be* the demo round.
+with the Emoji Pal demo round (`EmojiDeck`, `AppState.startDemoRound`) — the last
+onboarding step could *be* the demo round.
 
 ---
 
-## Animate the background confetti dots
-
-Make the dots drift instead of sitting still.
-
-**Why:** Everything else on the sheet moves — stickers pop in, buttons press,
-cards deal — so the static backdrop reads as flat by comparison.
-
-**Where to start:** `ConfettiSheet` in `StickerKit.swift`. It currently draws once
-into a `Canvas` from a seeded LCG, which is deliberate: positions must not
-reshuffle between redraws. Add a `TimelineView(.animation)` and offset each dot
-by a slow sine of its index so the scatter stays stable while it breathes. Keep
-the amplitude small — this is ambience, not weather. Must respect
-`accessibilityReduceMotion`, and stay off on `GameView` where it would distract
-from the cards.
-
----
 
 ## Reskin alerts and exit modals
 
@@ -106,3 +64,36 @@ so a friend in the picker looks like the same object they become in the grid.
 Watch out: tile color is currently keyed to carousel *position*, so a friend's
 color changes when the list reorders. If the color is going to be this prominent,
 derive it from something stable like the friend's `id` instead.
+
+---
+
+## Check whether videos get through the photo picker
+
+Videos show up inside People collections in the picker even though it is set to
+images only.
+
+**Why:** Anything that isn't a photo is dropped after picking, so a selection that
+includes videos can fall under the game size and trigger the "You picked N
+photos" alert for no reason the user can see.
+
+**Where to start:** `MultiImagePicker` in `HomeView.swift`. The filter was changed
+to `.all(of: [.images, .not(.videos)])` on 2026-10-05 but not verified on a device
+with a People album. Confirm videos no longer appear; if they still do, tell the
+user how many were skipped instead of silently dropping them. Also check Live
+Photos are still selectable.
+
+---
+
+## Keep syncing new photos, and show the user it's happening
+
+The rescan only runs when a friend is tapped to play, and the only sign of it is
+the AUTO-ADD NEW PICS switch on the home screen.
+
+**Why:** Someone who hasn't played a friend in months gets no new photos until
+they do, and nobody can tell whether a scan ran, is running, or found anything.
+
+**Where to start:** `Services/FriendRescanner.swift` exposes `phase` and
+`friendID` already. Open questions: scan every friend on app open rather than one
+on tap; show progress or a "3 new photos" badge on the friend's sticker in
+`FriendCarouselView`; where the on/off switch should live and how it explains
+itself; what to say when access is limited to selected photos.

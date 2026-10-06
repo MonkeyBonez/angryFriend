@@ -7,10 +7,16 @@ import SwiftData
 struct HomeView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
+    @AppStorage(FriendRescanner.enabledKey) private var autoScan = true
+    @AppStorage("hasSeenAddFriendTutorial") private var hasSeenTutorial = false
+    @State private var tutorial: TutorialMode? = nil
     @Query(sort: \Friend.createdAt, order: .reverse) private var savedFriends: [Friend]
 
     @State private var showMultiPicker = false
     @State private var permissionDenied = false
+    @State private var photoAccess: PHAuthorizationStatus = .notDetermined
+    @State private var showAccessAlert = false
     @State private var pickAlert: String? = nil
     @State private var titleLanded = false
 
@@ -19,8 +25,7 @@ struct HomeView: View {
 
     var body: some View {
         ZStack {
-            StickerTheme.sun.ignoresSafeArea()
-            ConfettiSheet(count: 30, seed: 11).ignoresSafeArea()
+            // The yellow sheet and the confetti dots are drawn once, in ContentView.
 
             // minHeight pins the stack to at least a full screen so the Spacer
             // actually pushes the footer to the bottom; it still scrolls when a
@@ -53,9 +58,23 @@ struct HomeView: View {
                 }
                 .scrollBounceBehavior(.basedOnSize)
             }
+
+            if let mode = tutorial {
+                AddFriendTutorialView(mode: mode) { exit in
+                    finishTutorial(mode: mode, exit: exit)
+                }
+                .zIndex(1)
+            }
         }
         .onAppear {
+            photoAccess = PhotoLibraryService.shared.authorizationStatus()
             Haptics.warmUp()
+            if appState.pendingAddFriend {
+                // Sent here from the demo result to add a real friend: let the
+                // screen land first, then carry on into the add flow.
+                appState.pendingAddFriend = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { requestAndPick() }
+            }
             guard !titleLanded else { return }
             withAnimation(.spring(response: 0.55, dampingFraction: 0.55)) { titleLanded = true }
         }
@@ -63,6 +82,22 @@ struct HomeView: View {
             MultiImagePicker { assetIdentifiers in
                 handlePickedAssets(assetIdentifiers)
             }
+        }
+        // Coming back from Settings: pick up whatever access was just granted.
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .active {
+                photoAccess = PhotoLibraryService.shared.authorizationStatus()
+            }
+        }
+        .alert("Allow All Photos", isPresented: $showAccessAlert) {
+            Button("Open Settings") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+            Button("Not Now", role: .cancel) {}
+        } message: {
+            Text("To auto-add new pics of your friends, allow access to all photos in Settings.")
         }
         .alert("Can't Start Game", isPresented: Binding(
             get: { pickAlert != nil },
@@ -113,7 +148,8 @@ struct HomeView: View {
                 onSelect: play,
                 onHold: viewAlbum,
                 onEdit: editFriend,
-                onAddNew: requestAndPick
+                onAddNew: requestAndPick,
+                onDemo: playDemo
             )
 
             Text("hold a sticker to peek at their album")
@@ -123,31 +159,21 @@ struct HomeView: View {
         }
     }
 
+    /// No friends yet: the emoji pal stands in the line-up alone so there's still
+    /// a round to play before anyone hands over photos.
     private var emptyState: some View {
         VStack(spacing: 14) {
-            ZStack {
-                // Side cards first so the middle one — the one holding the icon —
-                // sits on top of the fan.
-                blankCard(tile: 0).rotationEffect(.degrees(-10)).offset(x: -44)
-                blankCard(tile: 2).rotationEffect(.degrees(10)).offset(x: 44)
-                blankCard(tile: 1)
-                    .overlay {
-                        Image(systemName: "person.fill.questionmark")
-                            .font(.system(size: 32, weight: .bold))
-                            .foregroundStyle(StickerTheme.ink)
-                    }
-            }
-            .popIn(delay: 0.4, from: 0.5)
-
             Text("No suspects yet")
                 .font(.sticker(19, .black))
                 .foregroundStyle(StickerTheme.ink)
 
-            Text("Pick a handful of photos of one friend.\nWe'll find them and cut them into cards.")
-                .font(.sticker(13, .medium))
-                .foregroundStyle(StickerTheme.ink.opacity(0.7))
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 40)
+            EmojiPalSticker(index: 1, size: 96, action: playDemo)
+                .padding(.vertical, 8)
+                .popIn(delay: 0.4, from: 0.5)
+
+            Text("tap the emoji pal for a practice round")
+                .font(.sticker(10.5, .medium))
+                .foregroundStyle(StickerTheme.ink.opacity(0.65))
         }
         .popIn(delay: 0.35, from: 0.85, tilt: 0)
     }
@@ -172,20 +198,63 @@ struct HomeView: View {
     private var footer: some View {
         VStack(spacing: 12) {
             Button(action: requestAndPick) {
-                Label(savedFriends.isEmpty ? "Pick Photos of a Friend" : "Add Another Friend",
+                Label(savedFriends.isEmpty ? "Add a Friend's Photos" : "Add Another Friend's Photos",
                       systemImage: "photo.stack.fill")
             }
             .buttonStyle(StickerButtonStyle(background: StickerTheme.pink))
             .padding(.horizontal, 28)
             .popIn(delay: 0.45, from: 0.85, tilt: 0)
 
-            Text("tip: your People album in Photos works best")
-                .font(.sticker(10.5, .medium))
-                .foregroundStyle(StickerTheme.ink.opacity(0.65))
+            HStack(spacing: 4) {
+                Text("tip: your People album in Photos works best ·")
+                    .font(.sticker(10.5, .medium))
+                    .foregroundStyle(StickerTheme.ink.opacity(0.65))
+                Button("how?") {
+                    Haptics.press()
+                    tutorial = .replay
+                }
+                .font(.sticker(10.5, .black))
+                .underline()
+                .foregroundStyle(StickerTheme.ink)
+                .accessibilityLabel("How to add a friend")
+            }
 
             cardCountPicker
                 .padding(.top, 6)
+
+            autoScanToggle
         }
+    }
+
+    /// The switch only reads as on when a scan can actually run — which needs
+    /// the whole library, not just the photos picked so far.
+    private var autoScanIsOn: Bool {
+        autoScan && (photoAccess == .authorized || photoAccess == .notDetermined)
+    }
+
+    private var autoScanToggle: some View {
+        HStack(spacing: 8) {
+            Text("AUTO-ADD NEW PICS")
+                .font(.sticker(10.5, .black))
+                .foregroundStyle(StickerTheme.ink.opacity(0.7))
+                .padding(.trailing, 2)
+
+            Button(action: toggleAutoScan) {
+                Text(autoScanIsOn ? "ON" : "OFF")
+                    .font(.sticker(14, .black))
+                    .foregroundStyle(autoScanIsOn ? .white : StickerTheme.ink)
+                    .frame(width: 58, height: 34)
+                    .background(autoScanIsOn ? StickerTheme.mint : Color.white,
+                                in: RoundedRectangle(cornerRadius: 10))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(StickerTheme.ink, lineWidth: 2))
+                    .hardShadow(StickerTheme.ink, x: 2, y: 2)
+                    .rotationEffect(.degrees(autoScanIsOn ? -2 : 0))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Auto-add new pics of friends")
+            .accessibilityValue(autoScanIsOn ? "On" : "Off")
+        }
+        .popIn(delay: 0.55, from: 0.85, tilt: 0)
     }
 
     private var cardCountPicker: some View {
@@ -223,14 +292,6 @@ struct HomeView: View {
         .popIn(delay: 0.5, from: 0.85, tilt: 0)
     }
 
-    private func blankCard(tile: Int) -> some View {
-        RoundedRectangle(cornerRadius: 16)
-            .fill(StickerTheme.tile(tile))
-            .frame(width: 78, height: 78)
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(StickerTheme.ink, lineWidth: 2.5))
-            .hardShadow(StickerTheme.ink.opacity(0.3), x: 3, y: 3)
-    }
-
     private func sectionLabel(_ text: String) -> some View {
         Text(text)
             .font(.sticker(10.5, .black))
@@ -241,9 +302,35 @@ struct HomeView: View {
 
     // MARK: - Actions
 
+    private func toggleAutoScan() {
+        Haptics.flick()
+        if autoScanIsOn {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { autoScan = false }
+            appState.rescanner.cancel()
+            return
+        }
+
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { autoScan = true }
+        switch photoAccess {
+        case .authorized:
+            break
+        case .notDetermined:
+            Task { photoAccess = await PhotoLibraryService.shared.requestAuthorization() }
+        default:
+            // iOS only shows its own prompt once — after that, widening access
+            // (limited → all photos, or off → on) has to happen in Settings.
+            showAccessAlert = true
+        }
+    }
+
+    private func playDemo() {
+        appState.startDemoRound()
+    }
+
     private func play(_ friend: Friend) {
         appState.currentFriend = friend
         appState.usedPhotoIDs = []
+        appState.rescanner.start(for: friend, context: modelContext)
         appState.screen = .processing
     }
 
@@ -257,9 +344,20 @@ struct HomeView: View {
         appState.screen = .friendDetail
     }
 
+    /// First time through, the tutorial comes before the system photo prompt so
+    /// its last frame can explain what "all photos" is for before iOS asks.
     private func requestAndPick() {
+        if hasSeenTutorial {
+            requestAccessThenPick()
+        } else {
+            tutorial = .firstRun
+        }
+    }
+
+    private func requestAccessThenPick() {
         Task {
             let status = await PhotoLibraryService.shared.requestAuthorization()
+            photoAccess = status
             if status == .authorized || status == .limited {
                 permissionDenied = false
                 showMultiPicker = true
@@ -269,6 +367,16 @@ struct HomeView: View {
                     permissionDenied = true
                 }
             }
+        }
+    }
+
+    /// "Got it" always lands in the picker. Skipping the first-run card does too —
+    /// they tapped add-friend, so that's where they were headed.
+    private func finishTutorial(mode: TutorialMode, exit: TutorialExit) {
+        hasSeenTutorial = true
+        tutorial = nil
+        if exit == .gotIt || mode == .firstRun {
+            requestAccessThenPick()
         }
     }
 
@@ -298,7 +406,9 @@ struct MultiImagePicker: UIViewControllerRepresentable {
 
     func makeUIViewController(context: Context) -> PHPickerViewController {
         var config = PHPickerConfiguration(photoLibrary: .shared())
-        config.filter = .images
+        // Explicitly excluding videos as well: `.images` alone has let videos show
+        // up inside People collections.
+        config.filter = .all(of: [.images, .not(.videos)])
         config.selectionLimit = 0
         let picker = PHPickerViewController(configuration: config)
         picker.delegate = context.coordinator

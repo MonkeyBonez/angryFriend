@@ -15,11 +15,12 @@ struct ProcessingView: View {
     @State private var task: Task<Void, Never>? = nil
     /// Finished cutouts, shown as they land so the wait doubles as a preview.
     @State private var previews: [UIImage] = []
+    /// Set by "Play with N now" to stop waiting on the rescan for more photos.
+    @State private var playWithWhatWeHave = false
 
     var body: some View {
         ZStack {
-            StickerTheme.sun.ignoresSafeArea()
-            ConfettiSheet(count: 22, opacity: 0.45, seed: 23).ignoresSafeArea()
+            // Background sheet and dots come from ContentView.
 
             VStack(spacing: 0) {
                 Spacer()
@@ -79,9 +80,35 @@ struct ProcessingView: View {
                 .padding(.top, 12)
                 .contentTransition(.numericText())
 
-            previewStrip
-                .padding(.top, 26)
-                .frame(height: 46)
+            if case .findingPhotos(let found, _) = phase {
+                findingActions(found: found)
+                    .padding(.top, 22)
+            } else {
+                previewStrip
+                    .padding(.top, 26)
+                    .frame(height: 46)
+            }
+        }
+    }
+
+    /// Ways out of the wait for more photos: start short-handed, or leave.
+    private func findingActions(found: Int) -> some View {
+        VStack(spacing: 12) {
+            if found >= 4 {
+                Button("Play with \(found) now") {
+                    Haptics.press()
+                    playWithWhatWeHave = true
+                }
+                .buttonStyle(StickerButtonStyle(background: StickerTheme.pink, size: 14, fullWidth: false))
+            }
+
+            Button("Go Back") {
+                Haptics.press()
+                task?.cancel()
+                appState.currentFriend = nil
+                appState.screen = .home
+            }
+            .buttonStyle(StickerButtonStyle(background: .white, foreground: StickerTheme.ink, size: 14, fullWidth: false))
         }
     }
 
@@ -150,6 +177,8 @@ struct ProcessingView: View {
     // MARK: - Pipeline
 
     private func start() {
+        // Every real round passes through here; the emoji demo never does.
+        appState.isDemoRound = false
         task = Task {
             if let friend = appState.currentFriend {
                 await runReplay(for: friend)
@@ -228,6 +257,9 @@ struct ProcessingView: View {
             stickerData: coverImage?.jpegData(compressionQuality: 0.85) ?? Data(),
             photoMatches: discovery.matches.map { PhotoMatch(assetID: $0.asset.localIdentifier, faceBoundingBox: $0.faceBoundingBox) }
         )
+        // What later rescans match new photos against, and where they start from.
+        friend.identity = discovery.identity
+        friend.lastScannedAt = Date()
         modelContext.insert(friend)
         try? modelContext.save()
         appState.currentFriend = friend
@@ -241,6 +273,18 @@ struct ProcessingView: View {
     /// identity discovery needed, the face box for every photo is already stored.
     private func runReplay(for friend: Friend) async {
         let needed = appState.cardCount
+
+        // Not enough photos for a full grid yet: give the rescan a chance to find
+        // more before dealing. Once there are enough the game starts and the scan
+        // carries on behind it.
+        while friend.photoMatches.count < needed,
+              appState.rescanner.isScanning(for: friend),
+              !playWithWhatWeHave {
+            phase = .findingPhotos(friend.photoMatches.count, needed)
+            try? await Task.sleep(for: .milliseconds(250))
+            guard Task.isCancelled == false else { return }
+        }
+
         let available = friend.photoMatches.filter { !appState.usedPhotoIDs.contains($0.assetID) }
         let source = available.count >= needed ? available : friend.photoMatches
         let sampled = Array(source.shuffled().prefix(needed))
@@ -379,7 +423,7 @@ struct ProcessingView: View {
 
     private var progressFraction: Double {
         switch phase {
-        case .identifying(let done, let total), .extracting(let done, let total):
+        case .identifying(let done, let total), .extracting(let done, let total), .findingPhotos(let done, let total):
             return total > 0 ? Double(done) / Double(total) : 0
         case .idle, .error:
             return 0
@@ -391,6 +435,7 @@ struct ProcessingView: View {
         case .idle: return "warming up…"
         case .identifying(let done, let total): return "checked \(done) of \(total)"
         case .extracting(let done, let total): return "\(done) of \(total) cut out"
+        case .findingPhotos(let found, let needed): return "found \(found) of \(needed)"
         case .error: return ""
         }
     }
@@ -400,6 +445,7 @@ struct ProcessingView: View {
         case .idle: return "face.smiling"
         case .identifying: return "magnifyingglass"
         case .extracting: return "scissors"
+        case .findingPhotos: return "photo.on.rectangle.angled"
         case .error: return "exclamationmark.triangle.fill"
         }
     }
@@ -417,6 +463,7 @@ struct ProcessingView: View {
         case .idle: return "GETTING READY"
         case .identifying: return "WHO'S THAT?"
         case .extracting: return "SNIP SNIP"
+        case .findingPhotos: return "LOOKING AROUND"
         case .error: return "OOPS"
         }
     }
@@ -426,6 +473,7 @@ struct ProcessingView: View {
         case .idle: return "shuffling the deck…"
         case .identifying: return "spotting the face that keeps showing up"
         case .extracting: return "cutting \(friendLabel) out of every photo"
+        case .findingPhotos: return "finding photos of \(friendLabel)…"
         case .error(let msg): return msg
         }
     }
@@ -437,5 +485,6 @@ private enum ProcessPhase: Equatable {
     case idle
     case identifying(Int, Int)
     case extracting(Int, Int)
+    case findingPhotos(Int, Int)   // found so far, needed for a full grid
     case error(String)
 }

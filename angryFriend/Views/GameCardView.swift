@@ -67,8 +67,6 @@ struct GameCardView: View {
     }
 
     private func handleTap() {
-        let isAngry = appState.gameModel.cards[cardIndex].isAngry
-
         withAnimation(.spring(response: 0.16, dampingFraction: 0.5)) { squish = true }
         withAnimation(.spring(response: 0.34, dampingFraction: 0.45).delay(0.1)) { squish = false }
 
@@ -76,7 +74,8 @@ struct GameCardView: View {
             appState.gameModel.tap(index: cardIndex)
         }
 
-        if isAngry {
+        // Read after the tap: a demo round only decides the angry card as it's turned.
+        if appState.gameModel.losingIndex == cardIndex {
             Haptics.boom()
             triggerShake()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) {
