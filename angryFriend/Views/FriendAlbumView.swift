@@ -22,7 +22,7 @@ private struct FriendAlbumContent: View {
 
     @State private var assets: [PHAsset] = []
 
-    @State private var isSelecting = false
+    // Selection is always live: tap photos, then the bin. No mode to enter first.
     @State private var selectedIDs: Set<String> = []
     @State private var showDeleteConfirm = false
 
@@ -51,13 +51,12 @@ private struct FriendAlbumContent: View {
                               tilt: -1.5, size: 11.5,
                               background: StickerTheme.pink, foreground: .white)
                         .padding(.bottom, 8)
-                } else if isSelecting {
-                    TapeLabel(text: selectedIDs.isEmpty
-                                ? "TAP PHOTOS TO REMOVE THEM"
-                                : "\(selectedIDs.count) SELECTED",
+                } else if !selectedIDs.isEmpty {
+                    TapeLabel(text: "\(selectedIDs.count) SELECTED",
                               tilt: 1.5, size: 11.5,
                               background: StickerTheme.blue, foreground: .white)
                         .padding(.bottom, 8)
+                        .transition(.scale(scale: 0.8).combined(with: .opacity))
                 }
 
                 ScrollView {
@@ -69,7 +68,7 @@ private struct FriendAlbumContent: View {
                                 AlbumPhotoCell(
                                     asset: asset,
                                     index: index,
-                                    isSelecting: isSelecting,
+                                    isSelecting: !appState.isPickingCoverPhoto,
                                     isSelected: selectedIDs.contains(asset.localIdentifier)
                                 ) {
                                     handleTap(asset)
@@ -123,46 +122,35 @@ private struct FriendAlbumContent: View {
     private var topBar: some View {
         StickerTopBar(
             title: appState.isPickingCoverPhoto ? "Pick a Cover" : "\(displayName)'s Album",
-            leadingLabel: appState.isPickingCoverPhoto || isSelecting ? "Cancel" : "Done",
+            leadingLabel: appState.isPickingCoverPhoto ? "Cancel" : "Done",
             onLeading: handleLeading
         ) {
             if !appState.isPickingCoverPhoto {
                 HStack(spacing: 8) {
-                    if isSelecting {
-                        Button {
-                            Haptics.warn()
-                            showDeleteConfirm = true
-                        } label: {
-                            Image(systemName: "trash.fill")
-                        }
-                        .buttonStyle(StickerCircleButtonStyle(
-                            diameter: 32,
-                            background: selectedIDs.isEmpty ? Color.white.opacity(0.5) : StickerTheme.flame,
-                            foreground: selectedIDs.isEmpty ? StickerTheme.ink.opacity(0.4) : .white
-                        ))
-                        .disabled(selectedIDs.isEmpty)
-                        .accessibilityLabel("Remove selected photos")
-                    } else {
-                        Button {
-                            Haptics.press()
-                            showAddPicker = true
-                        } label: {
-                            Image(systemName: "plus")
-                        }
-                        .buttonStyle(StickerCircleButtonStyle(diameter: 32, background: StickerTheme.mint, foreground: .white))
-                        .accessibilityLabel("Add photos")
-
-                        Button {
-                            Haptics.press()
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) { isSelecting = true }
-                        } label: {
-                            Image(systemName: "checkmark.circle")
-                        }
-                        .buttonStyle(StickerCircleButtonStyle(diameter: 32))
-                        .disabled(assets.isEmpty)
-                        .opacity(assets.isEmpty ? 0.45 : 1)
-                        .accessibilityLabel("Select photos")
+                    Button {
+                        Haptics.press()
+                        showAddPicker = true
+                    } label: {
+                        Image(systemName: "plus")
                     }
+                    .buttonStyle(StickerCircleButtonStyle(diameter: 32, background: StickerTheme.mint, foreground: .white))
+                    .accessibilityLabel("Add photos")
+
+                    // Always there; wakes up as soon as something is selected.
+                    Button {
+                        Haptics.warn()
+                        showDeleteConfirm = true
+                    } label: {
+                        Image(systemName: "trash.fill")
+                    }
+                    .buttonStyle(StickerCircleButtonStyle(
+                        diameter: 32,
+                        background: selectedIDs.isEmpty ? Color.white.opacity(0.5) : StickerTheme.flame,
+                        foreground: selectedIDs.isEmpty ? StickerTheme.ink.opacity(0.4) : .white
+                    ))
+                    .disabled(selectedIDs.isEmpty)
+                    .animation(.spring(response: 0.3, dampingFraction: 0.7), value: selectedIDs.isEmpty)
+                    .accessibilityLabel("Remove selected photos")
                 }
             }
         }
@@ -210,11 +198,6 @@ private struct FriendAlbumContent: View {
         if appState.isPickingCoverPhoto {
             appState.isPickingCoverPhoto = false
             appState.screen = .friendDetail
-        } else if isSelecting {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                isSelecting = false
-                selectedIDs = []
-            }
         } else {
             appState.viewingFriend = nil
             appState.screen = .home
@@ -233,7 +216,7 @@ private struct FriendAlbumContent: View {
         if appState.isPickingCoverPhoto {
             Haptics.press()
             setCover(asset)
-        } else if isSelecting {
+        } else {
             Haptics.peel()
             withAnimation(.spring(response: 0.25, dampingFraction: 0.65)) {
                 toggleSelection(asset.localIdentifier)
@@ -290,7 +273,6 @@ private struct FriendAlbumContent: View {
         withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
             assets.removeAll { selectedIDs.contains($0.localIdentifier) }
             selectedIDs = []
-            isSelecting = false
         }
         Haptics.done()
     }
