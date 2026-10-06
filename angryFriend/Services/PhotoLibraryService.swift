@@ -40,34 +40,58 @@ actor PhotoLibraryService {
         PHPhotoLibrary.authorizationStatus(for: .readWrite)
     }
 
+    // MARK: - What the rescan looks at
+
+    /// Photos worth running face matching on. Out: screenshots and panoramas
+    /// (by subtype), anything under 300px a side (icons, thumbnails, stickers).
+    /// Videos are out by media type; hidden photos and the extra frames of a
+    /// burst are out by `PHFetchOptions` defaults. Animated images can't be
+    /// filtered in the predicate — see `isScannable`.
+    private nonisolated static let scanFilter = NSCompoundPredicate(andPredicateWithSubpredicates: [
+        NSPredicate(format: "(mediaSubtypes & %d) == 0",
+                    PHAssetMediaSubtype.photoScreenshot.rawValue | PHAssetMediaSubtype.photoPanorama.rawValue),
+        NSPredicate(format: "pixelWidth >= 300 AND pixelHeight >= 300"),
+    ])
+
+    private nonisolated static func isScannable(_ asset: PHAsset) -> Bool {
+        asset.playbackStyle != .imageAnimated   // GIFs
+    }
+
+    /// Returns the scannable assets plus the oldest shot date in the raw fetch,
+    /// so a caller walking backwards can step past a run of GIFs.
+    private nonisolated func fetchScannable(_ predicate: NSPredicate, limit: Int = 0) -> (assets: [PHAsset], oldestFetched: Date?) {
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [predicate, Self.scanFilter])
+        options.fetchLimit = limit
+        let result = PHAsset.fetchAssets(with: .image, options: options)
+        var assets: [PHAsset] = []
+        assets.reserveCapacity(result.count)
+        result.enumerateObjects { asset, _, _ in
+            if Self.isScannable(asset) { assets.append(asset) }
+        }
+        return (assets, result.lastObject?.creationDate)
+    }
+
     /// Every image taken after `date`, newest first — the rescan's candidate set.
     /// Photos that arrived after `date`: taken since then, or saved into the
     /// library since then with an older shot date (AirDrop, imports, saved
     /// attachments) — those carry their original creation date but a fresh
     /// modification date.
     nonisolated func fetchAssets(since date: Date) -> [PHAsset] {
-        let options = PHFetchOptions()
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        options.predicate = NSPredicate(format: "creationDate > %@ OR modificationDate > %@", date as NSDate, date as NSDate)
-        let result = PHAsset.fetchAssets(with: .image, options: options)
-        var assets: [PHAsset] = []
-        assets.reserveCapacity(result.count)
-        result.enumerateObjects { asset, _, _ in assets.append(asset) }
-        return assets
+        fetchScannable(NSPredicate(format: "creationDate > %@ OR modificationDate > %@", date as NSDate, date as NSDate)).assets
     }
 
     /// The next `limit` photos taken before `date`, newest first — one step of
-    /// a backwards walk through the library.
+    /// a backwards walk through the library. Empty only when nothing older is
+    /// left: a chunk that was entirely GIFs is skipped over, not reported.
     nonisolated func fetchAssets(before date: Date, limit: Int) -> [PHAsset] {
-        let options = PHFetchOptions()
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        options.predicate = NSPredicate(format: "creationDate < %@", date as NSDate)
-        options.fetchLimit = limit
-        let result = PHAsset.fetchAssets(with: .image, options: options)
-        var assets: [PHAsset] = []
-        assets.reserveCapacity(result.count)
-        result.enumerateObjects { asset, _, _ in assets.append(asset) }
-        return assets
+        var cursor = date
+        while true {
+            let (assets, oldestFetched) = fetchScannable(NSPredicate(format: "creationDate < %@", cursor as NSDate), limit: limit)
+            guard assets.isEmpty, let oldestFetched, oldestFetched < cursor else { return assets }
+            cursor = oldestFetched
+        }
     }
 
     /// Nonisolated so multiple callers can request images concurrently.

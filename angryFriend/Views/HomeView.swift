@@ -416,8 +416,8 @@ struct MultiImagePicker: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> PHPickerViewController {
         var config = PHPickerConfiguration(photoLibrary: .shared())
         // Explicitly excluding videos as well: `.images` alone has let videos show
-        // up inside People collections.
-        config.filter = .all(of: [.images, .not(.videos)])
+        // up inside People collections. Screenshots are never a friend's face.
+        config.filter = .all(of: [.images, .not(.videos), .not(.screenshots)])
         config.selectionLimit = 0
         let picker = PHPickerViewController(configuration: config)
         picker.delegate = context.coordinator
