@@ -43,14 +43,21 @@ enum CoverSticker {
     }
 
     private static var repaired = false
+    /// Bump when the way cutouts are framed changes, so saved covers get re-cut
+    /// to match the cards. 2 = subject fills 75% of the frame.
+    private static let framingVersion = 2
+    private static let framingVersionKey = "coverFramingVersion"
 
-    /// Re-cuts every cover still stored as JPEG, once per launch, quietly behind
-    /// the home screen. Each friend updates in place as their new sticker lands.
+    /// Re-cuts covers that are out of date — still stored as JPEG, or framed by
+    /// an older rule — once per launch, quietly behind the home screen. Each
+    /// friend updates in place as their new sticker lands.
     static func repairFlattenedCovers(_ friends: [Friend], context: ModelContext) async {
         guard !repaired else { return }
         repaired = true
+        let reframe = UserDefaults.standard.integer(forKey: framingVersionKey) < framingVersion
+        defer { UserDefaults.standard.set(framingVersion, forKey: framingVersionKey) }
 
-        for friend in friends where isFlattened(friend.stickerData) {
+        for friend in friends where reframe || isFlattened(friend.stickerData) {
             let candidates = Array(friend.photoMatches.prefix(10))
             let fetched = PHAsset.fetchAssets(withLocalIdentifiers: candidates.map(\.assetID), options: nil)
             var assetsByID: [String: PHAsset] = [:]

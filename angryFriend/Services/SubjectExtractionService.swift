@@ -88,7 +88,7 @@ actor SubjectExtractionService {
     // MARK: - Framing the cutout
 
     /// How much of the frame the friend should take up in their larger dimension.
-    private static let fill: CGFloat = 0.85
+    private static let fill: CGFloat = 0.75
     /// Output side in pixels; the cards and stickers never show more than this.
     private static let outputSide: CGFloat = 1024
 
