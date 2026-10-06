@@ -7,11 +7,17 @@ enum EmojiDeck {
     /// The emoji pal's own face — on the home screen sticker and the demo tag.
     static let mascot = "🥸"
 
-    /// Faces only (no hands, no objects) so the grid reads like a line-up.
+    /// Classic yellow smileys only — no creatures, hands or off-colour faces — so
+    /// the grid reads as one line-up of the same guy in different moods. The
+    /// angry ones stay out: 😡 is the reveal.
     static let faces = [
-        "😀", "😎", "🥸", "🤠", "🧐", "🤓", "😏", "🥳", "😇", "🤩",
-        "😜", "🤪", "🥶", "🥵", "🤯", "😱", "🤭", "🫠", "🙃", "😴",
-        "🤑", "🤡", "👻", "👽", "🤖", "😈", "🥺", "😤", "🫡", "🤔",
+        "😀", "😁", "😆", "🤣", "😂", "🙂", "😉", "😊", "😇", "🥰",
+        "😍", "🤩", "😘", "😋", "😛", "😜", "🤪", "😝", "🤑", "🤗",
+        "🤭", "🫢", "🤫", "🤔", "🫡", "🤐", "🤨", "😐", "😶", "🫥",
+        "😏", "😒", "🙄", "😬", "🤥", "😌", "😔", "😪", "🤤", "😴",
+        "😷", "🤒", "🤕", "🤯", "🤠", "🥳", "🥸", "😎", "🤓", "🧐",
+        "😕", "😟", "😮", "😲", "😳", "🥺", "🥹", "😨", "😰", "😢",
+        "😭", "😱", "😖", "😩", "🥱", "😤", "🫠", "🙃", "😵",
     ]
 
     /// Taps a demo round always survives before the angry card can turn up.
