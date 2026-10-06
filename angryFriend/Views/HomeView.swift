@@ -71,6 +71,7 @@ struct HomeView: View {
             Haptics.warmUp()
             // Covers saved as JPEG lost their transparency; re-cut them once.
             Task { await CoverSticker.repairFlattenedCovers(savedFriends, context: modelContext) }
+            appState.rescanner.catchUp(friends: savedFriends, context: modelContext)
             if appState.pendingAddFriend {
                 // Sent here from the demo result to add a real friend: let the
                 // screen land first, then carry on into the add flow.
@@ -89,6 +90,9 @@ struct HomeView: View {
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
                 photoAccess = PhotoLibraryService.shared.authorizationStatus()
+                // Back from the background: finish any scan that was cut short
+                // and look for photos taken in the meantime.
+                appState.rescanner.catchUp(friends: savedFriends, context: modelContext)
             }
         }
         .alert("Allow All Photos", isPresented: $showAccessAlert) {
@@ -315,9 +319,12 @@ struct HomeView: View {
         withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { autoScan = true }
         switch photoAccess {
         case .authorized:
-            break
+            appState.rescanner.catchUp(friends: savedFriends, context: modelContext, ignoringThrottle: true)
         case .notDetermined:
-            Task { photoAccess = await PhotoLibraryService.shared.requestAuthorization() }
+            Task {
+                photoAccess = await PhotoLibraryService.shared.requestAuthorization()
+                appState.rescanner.catchUp(friends: savedFriends, context: modelContext, ignoringThrottle: true)
+            }
         default:
             // iOS only shows its own prompt once — after that, widening access
             // (limited → all photos, or off → on) has to happen in Settings.

@@ -41,10 +41,14 @@ actor PhotoLibraryService {
     }
 
     /// Every image taken after `date`, newest first — the rescan's candidate set.
+    /// Photos that arrived after `date`: taken since then, or saved into the
+    /// library since then with an older shot date (AirDrop, imports, saved
+    /// attachments) — those carry their original creation date but a fresh
+    /// modification date.
     nonisolated func fetchAssets(since date: Date) -> [PHAsset] {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        options.predicate = NSPredicate(format: "creationDate > %@", date as NSDate)
+        options.predicate = NSPredicate(format: "creationDate > %@ OR modificationDate > %@", date as NSDate, date as NSDate)
         let result = PHAsset.fetchAssets(with: .image, options: options)
         var assets: [PHAsset] = []
         assets.reserveCapacity(result.count)

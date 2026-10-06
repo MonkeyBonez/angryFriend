@@ -79,10 +79,91 @@ actor SubjectExtractionService {
             guard let outCG = context.createCGImage(ciImage, from: ciImage.extent) else {
                 return faceAwareSquareCrop(normalized, faceBox: faceBox)
             }
-            return faceAwareSquareCrop(UIImage(cgImage: outCG), faceBox: faceBox)
+            return frameSubject(outCG, faceBox: faceBox)
         } catch {
             return faceAwareSquareCrop(normalized, faceBox: faceBox)
         }
+    }
+
+    // MARK: - Framing the cutout
+
+    /// How much of the frame the friend should take up in their larger dimension.
+    private static let fill: CGFloat = 0.85
+    /// Output side in pixels; the cards and stickers never show more than this.
+    private static let outputSide: CGFloat = 1024
+
+    /// Frames a cutout so the friend fills the card instead of floating small in a
+    /// square cut from the whole photo: a compact subject is centred and scaled to
+    /// `fill` of the frame; a full-length figure gets a head-and-shoulders frame
+    /// anchored just above the top of the subject. The background is transparent,
+    /// so the frame can extend past the photo's edges without showing anything.
+    private func frameSubject(_ cutout: CGImage, faceBox: CGRect) -> UIImage {
+        let w = CGFloat(cutout.width)
+        let h = CGFloat(cutout.height)
+        guard let bounds = Self.opaqueBounds(of: cutout) else {
+            return faceAwareSquareCrop(UIImage(cgImage: cutout), faceBox: faceBox)
+        }
+
+        // Vision box (normalized, y-up) → pixels, y-down.
+        let face = CGRect(x: faceBox.minX * w, y: (1 - faceBox.maxY) * h,
+                          width: faceBox.width * w, height: faceBox.height * h)
+
+        var side: CGFloat
+        var origin: CGPoint
+        if bounds.height > 1.6 * bounds.width, face.height > 0 {
+            // Standing figure: shoulders span the frame, head just inside the top.
+            side = Swift.max(bounds.width / Self.fill, face.height * 4.5)
+            origin = CGPoint(x: face.midX - side / 2, y: bounds.minY - side * (1 - Self.fill) / 2)
+        } else {
+            side = Swift.max(bounds.width, bounds.height) / Self.fill
+            origin = CGPoint(x: bounds.midX - side / 2, y: bounds.midY - side / 2)
+        }
+        // Never zoom out past the photo itself, never blow up a speck.
+        side = Swift.min(Swift.max(side, 96), Swift.max(w, h))
+
+        let out = Swift.min(side, Self.outputSide)
+        let scale = out / side
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = false
+        return UIGraphicsImageRenderer(size: CGSize(width: out, height: out), format: format).image { _ in
+            UIImage(cgImage: cutout).draw(in: CGRect(x: -origin.x * scale, y: -origin.y * scale,
+                                                     width: w * scale, height: h * scale))
+        }
+    }
+
+    /// Pixel bounds of everything non-transparent, from a downsampled alpha scan
+    /// (top-left origin, padded by one sample so edges aren't shaved).
+    private static func opaqueBounds(of cg: CGImage) -> CGRect? {
+        let longest = Swift.max(cg.width, cg.height)
+        let scale = Swift.min(1, 256.0 / Double(longest))
+        let w = Swift.max(1, Int(Double(cg.width) * scale))
+        let h = Swift.max(1, Int(Double(cg.height) * scale))
+        var pixels = [UInt8](repeating: 0, count: w * h * 4)
+        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard drawn else { return nil }
+
+        var minX = w, minY = h, maxX = -1, maxY = -1
+        for y in 0..<h {
+            for x in 0..<w where pixels[(y * w + x) * 4 + 3] > 24 {
+                minX = Swift.min(minX, x); maxX = Swift.max(maxX, x)
+                minY = Swift.min(minY, y); maxY = Swift.max(maxY, y)
+            }
+        }
+        guard maxX >= 0 else { return nil }
+
+        // Bitmap rows run top-down, matching CGImage/UIKit coordinates.
+        let inv = 1 / scale
+        let rect = CGRect(x: Double(minX) * inv, y: Double(minY) * inv,
+                          width: Double(maxX - minX + 1) * inv, height: Double(maxY - minY + 1) * inv)
+        return rect.insetBy(dx: -inv, dy: -inv)
     }
 
     // MARK: - Face detection on original image
@@ -179,13 +260,18 @@ actor SubjectExtractionService {
 
     // MARK: - Face-aware square crop
 
-    /// Crops to a square centered on the face, keeping the friend in frame.
+    /// Crops to a square centered on the face, keeping the friend in frame — a
+    /// head-and-shoulders frame when the face is known, so a friend far from the
+    /// camera isn't a speck in a square cut from the whole photo.
     /// Falls back to center crop if faceBox is zero.
     private func faceAwareSquareCrop(_ image: UIImage, faceBox: CGRect) -> UIImage {
         guard let cg = image.cgImage else { return image }
         let w = CGFloat(cg.width)
         let h = CGFloat(cg.height)
-        let side = Swift.min(w, h)
+        var side = Swift.min(w, h)
+        if faceBox != .zero {
+            side = Swift.min(side, Swift.max(faceBox.height * h * 4.5, 200))
+        }
 
         // Convert Vision bbox center (normalized, y-up) → CGImage pixels (y-down)
         let faceCenterX = faceBox.midX * w

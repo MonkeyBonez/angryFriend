@@ -1,14 +1,20 @@
 import Foundation
 import Photos
 import SwiftData
+import UIKit
 import os
 
-/// Looks through the camera roll for new photos of a saved friend whenever that
-/// friend is picked to play, and grows their album with what it finds.
+/// Looks through the camera roll for new photos of a saved friend and grows
+/// their album with what it finds. Runs when a friend is picked to play, and
+/// catches up on every friend when the app comes to the foreground.
 ///
 /// Two passes: photos already on the device first (fast, no downloads), then the
 /// ones that only exist in iCloud. Lives on `AppState` rather than in a view so a
 /// scan keeps going across the processing screen, the game and the result.
+///
+/// Progress is written to the friend as it happens — every match, and a cursor
+/// after every chunk — so a scan cut short by the app being backgrounded or
+/// killed resumes from where it stopped, never from the start.
 @Observable
 @MainActor
 final class FriendRescanner {
@@ -23,7 +29,10 @@ final class FriendRescanner {
     static let enabledKey = "autoScanNewPhotos"
 
     private static let logger = Logger(subsystem: "com.angryFriend", category: "Rescan")
+    private static let localChunkSize = 24
     private static let cloudChunkSize = 12
+    /// A catch-up pass re-checks every friend; don't do it more often than this.
+    private static let catchUpInterval: TimeInterval = 5 * 60
 
     private(set) var phase: Phase = .idle
     private(set) var friendID: UUID? = nil
@@ -33,28 +42,50 @@ final class FriendRescanner {
     private var generation = 0
     private var activeFriend: Friend? = nil
     private var activeContext: ModelContext? = nil
+    /// Friends still waiting their turn in a catch-up pass.
+    private var queue: [Friend] = []
+    private var lastCatchUp: Date? = nil
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     static var isEnabled: Bool {
         UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
     }
 
+    private static var canScan: Bool {
+        isEnabled && PhotoLibraryService.shared.authorizationStatus() == .authorized
+    }
+
+    var isRunning: Bool { phase == .local || phase == .cloud }
+
     func isScanning(for friend: Friend) -> Bool {
-        friendID == friend.id && (phase == .local || phase == .cloud)
+        friendID == friend.id && isRunning
     }
 
     /// Starts a scan for `friend`, replacing any scan already running. Does
     /// nothing when the switch is off or the app can't see the whole library.
     func start(for friend: Friend, context: ModelContext) {
         cancel()
-        guard Self.isEnabled,
-              PhotoLibraryService.shared.authorizationStatus() == .authorized else { return }
+        guard Self.canScan else { return }
+        begin(friend, context: context)
+    }
 
-        friendID = friend.id
-        activeFriend = friend
+    /// Picks up where any earlier scan left off, for every friend with work
+    /// outstanding: unseen photos since their cursor, or iCloud photos still
+    /// queued. Runs one friend at a time; a play-triggered scan takes over.
+    func catchUp(friends: [Friend], context: ModelContext, ignoringThrottle: Bool = false) {
+        guard !isRunning, Self.canScan, !friends.isEmpty else { return }
+        if !ignoringThrottle, let last = lastCatchUp,
+           Date().timeIntervalSince(last) < Self.catchUpInterval { return }
+        lastCatchUp = Date()
+
+        queue = friends.filter { friend in
+            !friend.pendingCloudIDs.isEmpty
+                || !PhotoLibraryService.shared.fetchAssets(since: friend.lastScannedAt ?? friend.createdAt).isEmpty
+        }
+        guard !queue.isEmpty else { return }
+        Self.logger.info("Catch-up: \(self.queue.count) friend(s) have new photos to check")
         activeContext = context
-        phase = .local
-        let gen = generation
-        task = Task { await run(generation: gen) }
+        startNext()
     }
 
     func cancel() {
@@ -65,12 +96,59 @@ final class FriendRescanner {
         friendID = nil
         activeFriend = nil
         activeContext = nil
+        queue = []
+        endBackgroundTask()
+    }
+
+    // MARK: - Lifecycle
+
+    private func begin(_ friend: Friend, context: ModelContext) {
+        friendID = friend.id
+        activeFriend = friend
+        activeContext = context
+        phase = .local
+        beginBackgroundTask()
+        let gen = generation
+        task = Task { await run(generation: gen) }
+    }
+
+    private func startNext() {
+        guard let context = activeContext, !queue.isEmpty else { return }
+        let friend = queue.removeFirst()
+        guard !friend.isDeleted else { startNext(); return }
+        begin(friend, context: context)
+    }
+
+    private func finish(generation gen: Int) {
+        guard gen == generation else { return }
+        phase = .done
+        endBackgroundTask()
+        startNext()
+    }
+
+    /// Asks iOS for extra time when the app is sent to the background mid-scan —
+    /// usually enough to finish the current chunk and write the cursor. When it
+    /// runs out the scan is cancelled; whatever was saved is picked up next time.
+    private func beginBackgroundTask() {
+        endBackgroundTask()
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "friend-rescan") { [weak self] in
+            Task { @MainActor in
+                Self.logger.info("Background time expired; scan will resume next launch")
+                self?.cancel()
+            }
+        }
+    }
+
+    private func endBackgroundTask() {
+        guard backgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
     }
 
     // MARK: - Scan
 
     private func run(generation gen: Int) async {
-        defer { if gen == generation { phase = .done } }
+        defer { finish(generation: gen) }
         guard let friend = activeFriend else { return }
 
         // Loading the model blocks, so keep it off the main thread.
@@ -90,22 +168,40 @@ final class FriendRescanner {
             save()
         }
 
-        // Pass 1 — photos on this device, taken since the last finished scan.
+        // Pass 1 — photos on this device, taken since the cursor. Oldest first,
+        // in chunks; the cursor moves up after each one, so an interrupted pass
+        // resumes at the chunk it was on rather than re-checking everything.
         let scanStart = Date()
         let known = Set(friend.photoMatches.map(\.assetID))
         let alreadyPending = Set(friend.pendingCloudIDs)
-        let fresh = PhotoLibraryService.shared
+        let fresh = Array(PhotoLibraryService.shared
             .fetchAssets(since: friend.lastScannedAt ?? friend.createdAt)
             .filter { !known.contains($0.localIdentifier) && !alreadyPending.contains($0.localIdentifier) }
+            .reversed())
 
         if !fresh.isEmpty {
-            let local = await service.findFriend(identity: identity, in: fresh, allowNetwork: false) { face in
+            Self.logger.info("Local pass: \(fresh.count) new photo(s) to check")
+        }
+        var index = 0
+        while index < fresh.count {
+            let chunk = Array(fresh[index..<min(index + Self.localChunkSize, fresh.count)])
+            index += chunk.count
+            let local = await service.findFriend(identity: identity, in: chunk, allowNetwork: false) { face in
                 Task { @MainActor in self.add([face], generation: gen) }
             }
             guard isCurrent(gen) else { return }
             add(local.found, generation: gen)
             guard local.completed else { return }
             friend.pendingCloudIDs.append(contentsOf: local.unloadedIDs)
+            // A second back from the newest photo checked, so a burst of shots
+            // sharing that second isn't skipped on resume (known IDs dedupe).
+            // Never moves backwards: imported photos with old shot dates sort
+            // first and must not drag the cursor into the past.
+            if let newest = chunk.last?.creationDate {
+                let cursor = newest.addingTimeInterval(-1)
+                friend.lastScannedAt = max(friend.lastScannedAt ?? friend.createdAt, cursor)
+            }
+            save()
         }
         friend.lastScannedAt = scanStart
         save()
@@ -121,8 +217,9 @@ final class FriendRescanner {
         save()
         guard !cloud.isEmpty else { return }
 
+        Self.logger.info("Cloud pass: \(cloud.count) photo(s) to download and check")
         phase = .cloud
-        var index = 0
+        index = 0
         while index < cloud.count {
             let chunk = Array(cloud[index..<min(index + Self.cloudChunkSize, cloud.count)])
             index += chunk.count
