@@ -254,7 +254,7 @@ struct ProcessingView: View {
         let name = savedFriends.isEmpty ? "Friend" : "Friend \(savedFriends.count + 1)"
         let friend = Friend(
             name: name,
-            stickerData: coverImage?.jpegData(compressionQuality: 0.85) ?? Data(),
+            stickerData: coverImage.flatMap(CoverSticker.encode) ?? Data(),
             photoMatches: discovery.matches.map { PhotoMatch(assetID: $0.asset.localIdentifier, faceBoundingBox: $0.faceBoundingBox) }
         )
         // What later rescans match new photos against, and where they start from.
@@ -405,13 +405,7 @@ struct ProcessingView: View {
     }
 
     private static func loadAndExtract(asset: PHAsset, box: CGRect) async -> UIImage? {
-        let targetSize = CGSize(width: 1024, height: 1024)
-        var image = await PhotoLibraryService.shared.loadImage(for: asset, targetSize: targetSize, allowNetwork: false)
-        if image == nil {
-            image = await PhotoLibraryService.shared.loadImage(for: asset, targetSize: targetSize, allowNetwork: true)
-        }
-        guard let image else { return nil }
-        return await SubjectExtractionService.shared.extractSubject(from: image, faceBoundingBox: box)
+        await CoverSticker.cutout(asset: asset, box: box)
     }
 
     // MARK: - Phase helpers

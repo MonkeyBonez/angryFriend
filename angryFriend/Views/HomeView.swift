@@ -69,6 +69,8 @@ struct HomeView: View {
         .onAppear {
             photoAccess = PhotoLibraryService.shared.authorizationStatus()
             Haptics.warmUp()
+            // Covers saved as JPEG lost their transparency; re-cut them once.
+            Task { await CoverSticker.repairFlattenedCovers(savedFriends, context: modelContext) }
             if appState.pendingAddFriend {
                 // Sent here from the demo result to add a real friend: let the
                 // screen land first, then carry on into the add flow.

@@ -260,25 +260,19 @@ private struct FriendAlbumContent: View {
         Task {
             defer { isSettingCover = false }
 
-            let targetSize = CGSize(width: 1024, height: 1024)
-            var image = await PhotoLibraryService.shared.loadImage(for: asset, targetSize: targetSize, allowNetwork: false)
-            if image == nil {
-                image = await PhotoLibraryService.shared.loadImage(for: asset, targetSize: targetSize, allowNetwork: true)
-            }
-            guard let image else {
+            guard let cutout = await CoverSticker.cutout(asset: asset, box: match.faceBoundingBox) else {
                 Haptics.warn()
                 coverStatusMessage = "Couldn't load that photo."
                 return
             }
 
-            let cutout = await SubjectExtractionService.shared.extractSubject(from: image, faceBoundingBox: match.faceBoundingBox)
             guard FaceMatchingService.hasDetectableFace(in: cutout) else {
                 Haptics.warn()
                 coverStatusMessage = "Couldn't clearly detect a face in that cutout — try a different photo."
                 return
             }
 
-            friend.stickerData = cutout.jpegData(compressionQuality: 0.85) ?? friend.stickerData
+            friend.stickerData = CoverSticker.encode(cutout) ?? friend.stickerData
             try? modelContext.save()
             Haptics.done()
             appState.isPickingCoverPhoto = false
