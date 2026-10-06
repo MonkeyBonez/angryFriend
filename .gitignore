@@ -50,3 +50,6 @@ PhotosOfFriends/
 PhotosOfRandoms/
 test_data/
 debug_chips/
+marketing/appstore-screenshots/shots/
+marketing/appstore-screenshots/final/
+marketing/appstore-screenshots/_*.html
