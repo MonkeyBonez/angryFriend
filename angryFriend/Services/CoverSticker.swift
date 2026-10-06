@@ -44,8 +44,8 @@ enum CoverSticker {
 
     private static var repaired = false
     /// Bump when the way cutouts are framed changes, so saved covers get re-cut
-    /// to match the cards. 2 = subject fills 75% of the frame.
-    private static let framingVersion = 2
+    /// to match the cards. 3 = subject fills 65% of the frame.
+    private static let framingVersion = 3
     private static let framingVersionKey = "coverFramingVersion"
 
     /// Re-cuts covers that are out of date — still stored as JPEG, or framed by

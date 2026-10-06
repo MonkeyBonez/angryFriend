@@ -284,6 +284,8 @@ private struct FriendAlbumContent: View {
 
     private func removeSelected() {
         friend.photoMatches.removeAll { selectedIDs.contains($0.assetID) }
+        // Removed on purpose: the rescan must not quietly put these back.
+        friend.excludedIDs.append(contentsOf: selectedIDs.filter { !friend.excludedIDs.contains($0) })
         try? modelContext.save()
         withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
             assets.removeAll { selectedIDs.contains($0.localIdentifier) }
@@ -296,6 +298,8 @@ private struct FriendAlbumContent: View {
     // MARK: - Add (deduped, identity-checked)
 
     private func addPhotos(_ identifiers: [String]) {
+        // Picking a photo back by hand lifts its exclusion.
+        friend.excludedIDs.removeAll { identifiers.contains($0) }
         let existingIDs = Set(friend.photoMatches.map(\.assetID))
         let newIDs = identifiers.filter { !existingIDs.contains($0) }
 

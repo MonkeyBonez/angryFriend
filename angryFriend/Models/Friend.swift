@@ -35,6 +35,9 @@ final class Friend {
     var identityData: Data? = nil           // up to 3 face embeddings, flat [Float] bytes — what a rescan matches against
     var lastScannedAt: Date? = nil          // camera roll is checked for photos newer than this; nil → createdAt
     var pendingCloudIDs: [String] = [String]()  // new photos with no local copy yet — the iCloud pass picks these up
+    var backfillBefore: Date? = nil         // older photos are checked back from here; nil → createdAt
+    var backfillDone: Bool = false          // the whole library before createdAt has been checked
+    var excludedIDs: [String] = [String]()  // removed from the album on purpose — a rescan must never add them back
 
     init(name: String, stickerData: Data, photoMatches: [PhotoMatch]) {
         self.id = UUID()

@@ -8,9 +8,12 @@ import os
 /// their album with what it finds. Runs when a friend is picked to play, and
 /// catches up on every friend when the app comes to the foreground.
 ///
-/// Two passes: photos already on the device first (fast, no downloads), then the
-/// ones that only exist in iCloud. Lives on `AppState` rather than in a view so a
-/// scan keeps going across the processing screen, the game and the result.
+/// Order of work: new photos on the device first (fast, no downloads), then the
+/// ones that only exist in iCloud, then a walk back through everything older
+/// than the friend — the whole library, eventually. Lives on `AppState` rather
+/// than in a view so a scan keeps going across the processing screen, the game
+/// and the result. Photos removed from the album by hand (`Friend.excludedIDs`)
+/// are never added back.
 ///
 /// Progress is written to the friend as it happens — every match, and a cursor
 /// after every chunk — so a scan cut short by the app being backgrounded or
@@ -20,8 +23,9 @@ import os
 final class FriendRescanner {
     enum Phase: Equatable {
         case idle
-        case local
-        case cloud
+        case local      // new photos on this device
+        case backfill   // older photos on this device, walking back through the library
+        case cloud      // photos that only exist in iCloud
         case done
     }
 
@@ -55,7 +59,7 @@ final class FriendRescanner {
         isEnabled && PhotoLibraryService.shared.authorizationStatus() == .authorized
     }
 
-    var isRunning: Bool { phase == .local || phase == .cloud }
+    var isRunning: Bool { phase == .local || phase == .backfill || phase == .cloud }
 
     func isScanning(for friend: Friend) -> Bool {
         friendID == friend.id && isRunning
@@ -79,7 +83,8 @@ final class FriendRescanner {
         lastCatchUp = Date()
 
         queue = friends.filter { friend in
-            !friend.pendingCloudIDs.isEmpty
+            !friend.backfillDone
+                || !friend.pendingCloudIDs.isEmpty
                 || !PhotoLibraryService.shared.fetchAssets(since: friend.lastScannedAt ?? friend.createdAt).isEmpty
         }
         guard !queue.isEmpty else { return }
@@ -168,19 +173,29 @@ final class FriendRescanner {
             save()
         }
 
-        // Pass 1 — photos on this device, taken since the cursor. Oldest first,
-        // in chunks; the cursor moves up after each one, so an interrupted pass
-        // resumes at the chunk it was on rather than re-checking everything.
+        // Newest photos first so a fresh shot shows up fast, then whatever iCloud
+        // photos that queued, then the slow walk back through the older library
+        // (and the iCloud photos it queues). Every pass saves as it goes.
+        guard await newPhotosPass(friend, identity: identity, service: service, generation: gen) else { return }
+        guard await cloudPass(friend, identity: identity, service: service, generation: gen) else { return }
+        guard await backfillPass(friend, identity: identity, service: service, generation: gen) else { return }
+        _ = await cloudPass(friend, identity: identity, service: service, generation: gen)
+    }
+
+    /// Photos on this device taken (or saved) since the cursor. Oldest first, in
+    /// chunks; the cursor moves up after each one, so an interrupted pass resumes
+    /// at the chunk it was on rather than re-checking everything.
+    private func newPhotosPass(_ friend: Friend, identity: [FaceEmbedding], service: FaceMatchingService, generation gen: Int) async -> Bool {
+        phase = .local
         let scanStart = Date()
-        let known = Set(friend.photoMatches.map(\.assetID))
-        let alreadyPending = Set(friend.pendingCloudIDs)
+        let skip = Set(friend.photoMatches.map(\.assetID) + friend.pendingCloudIDs + friend.excludedIDs)
         let fresh = Array(PhotoLibraryService.shared
             .fetchAssets(since: friend.lastScannedAt ?? friend.createdAt)
-            .filter { !known.contains($0.localIdentifier) && !alreadyPending.contains($0.localIdentifier) }
+            .filter { !skip.contains($0.localIdentifier) }
             .reversed())
 
         if !fresh.isEmpty {
-            Self.logger.info("Local pass: \(fresh.count) new photo(s) to check")
+            Self.logger.info("New photos: \(fresh.count) to check")
         }
         var index = 0
         while index < fresh.count {
@@ -189,9 +204,9 @@ final class FriendRescanner {
             let local = await service.findFriend(identity: identity, in: chunk, allowNetwork: false) { face in
                 Task { @MainActor in self.add([face], generation: gen) }
             }
-            guard isCurrent(gen) else { return }
+            guard isCurrent(gen) else { return false }
             add(local.found, generation: gen)
-            guard local.completed else { return }
+            guard local.completed else { return false }
             friend.pendingCloudIDs.append(contentsOf: local.unloadedIDs)
             // A second back from the newest photo checked, so a burst of shots
             // sharing that second isn't skipped on resume (known IDs dedupe).
@@ -205,33 +220,81 @@ final class FriendRescanner {
         }
         friend.lastScannedAt = scanStart
         save()
+        return true
+    }
 
-        // Pass 2 — photos with no local copy. Done in small chunks, each one
-        // recorded as it finishes, so quitting mid-way doesn't redo downloads.
+    /// Everything taken before the friend was created, newest first, one chunk
+    /// at a time with the cursor saved after each — a big library takes many
+    /// sittings, and each one carries on from the last. Ends when the walk
+    /// reaches the oldest photo.
+    private func backfillPass(_ friend: Friend, identity: [FaceEmbedding], service: FaceMatchingService, generation gen: Int) async -> Bool {
+        guard !friend.backfillDone else { return true }
+        phase = .backfill
+        if friend.backfillBefore == nil {
+            Self.logger.info("Backfill: starting the walk back through older photos")
+        }
+        while !friend.backfillDone {
+            let cursor = friend.backfillBefore ?? friend.createdAt
+            let chunk = PhotoLibraryService.shared.fetchAssets(before: cursor, limit: Self.localChunkSize)
+            guard let oldest = chunk.last?.creationDate else {
+                friend.backfillDone = true
+                save()
+                Self.logger.info("Backfill: reached the oldest photo; album has \(friend.photoMatches.count)")
+                return true
+            }
+
+            let skip = Set(friend.photoMatches.map(\.assetID) + friend.pendingCloudIDs + friend.excludedIDs)
+            let toCheck = chunk.filter { !skip.contains($0.localIdentifier) }
+            if !toCheck.isEmpty {
+                let result = await service.findFriend(identity: identity, in: toCheck, allowNetwork: false) { face in
+                    Task { @MainActor in self.add([face], generation: gen) }
+                }
+                guard isCurrent(gen) else { return false }
+                add(result.found, generation: gen)
+                guard result.completed else { return false }
+                friend.pendingCloudIDs.append(contentsOf: result.unloadedIDs)
+            }
+            // Photos sharing the oldest second are re-fetched next chunk; known
+            // IDs dedupe them, and the walk still moves because `<` is strict
+            // once the cursor passes them.
+            friend.backfillBefore = oldest.addingTimeInterval(1)
+            if friend.backfillBefore == cursor {
+                // Degenerate: a whole chunk of photos sharing one second.
+                friend.backfillBefore = oldest
+            }
+            save()
+        }
+        return true
+    }
+
+    /// Photos with no local copy. Done in small chunks, each one recorded as it
+    /// finishes, so quitting mid-way doesn't redo downloads.
+    private func cloudPass(_ friend: Friend, identity: [FaceEmbedding], service: FaceMatchingService, generation gen: Int) async -> Bool {
         let pendingAssets = Self.assets(withIDs: friend.pendingCloudIDs)
-        let stillKnown = Set(friend.photoMatches.map(\.assetID))
+        let skip = Set(friend.photoMatches.map(\.assetID) + friend.excludedIDs)
         let cloud = friend.pendingCloudIDs.compactMap { pendingAssets[$0] }
-            .filter { !stillKnown.contains($0.localIdentifier) }
+            .filter { !skip.contains($0.localIdentifier) }
         // Photos deleted from the library since they were queued drop out here.
         friend.pendingCloudIDs = cloud.map(\.localIdentifier)
         save()
-        guard !cloud.isEmpty else { return }
+        guard !cloud.isEmpty else { return true }
 
         Self.logger.info("Cloud pass: \(cloud.count) photo(s) to download and check")
         phase = .cloud
-        index = 0
+        var index = 0
         while index < cloud.count {
             let chunk = Array(cloud[index..<min(index + Self.cloudChunkSize, cloud.count)])
             index += chunk.count
             let result = await service.findFriend(identity: identity, in: chunk, allowNetwork: true) { face in
                 Task { @MainActor in self.add([face], generation: gen) }
             }
-            guard isCurrent(gen) else { return }
+            guard isCurrent(gen) else { return false }
             add(result.found, generation: gen)
             // Anything that still wouldn't load (offline, timed out) stays queued.
             friend.pendingCloudIDs.removeAll { result.resolvedIDs.contains($0) }
             save()
         }
+        return true
     }
 
     private func isCurrent(_ gen: Int) -> Bool {
@@ -240,7 +303,7 @@ final class FriendRescanner {
 
     private func add(_ faces: [FoundFace], generation gen: Int) {
         guard gen == generation, let friend = activeFriend, !friend.isDeleted else { return }
-        var known = Set(friend.photoMatches.map(\.assetID))
+        var known = Set(friend.photoMatches.map(\.assetID) + friend.excludedIDs)
         let new = faces.filter { known.insert($0.assetID).inserted }
         guard !new.isEmpty else { return }
         friend.photoMatches.append(contentsOf: new.map {
