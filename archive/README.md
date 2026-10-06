@@ -23,3 +23,8 @@ threshold-tuning screen — is useful again later.
   task for saved friends and its toast UI
 - `SeedPickerView_with-scan.swift` — incl. the single "Choose Photo" flow
 - `Friend_with-scan-fields.swift` — model incl. scan-resumption date/flag fields
+
+**Update 2026-10-05:** an incremental rescan is back in the app
+(`Services/FriendRescanner.swift`). It only checks photos taken since a friend's
+last scan and matches them against that friend's stored identity. The
+full-library scan in this folder is still not used.

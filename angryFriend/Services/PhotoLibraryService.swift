@@ -36,6 +36,22 @@ actor PhotoLibraryService {
         await PHPhotoLibrary.requestAuthorization(for: .readWrite)
     }
 
+    nonisolated func authorizationStatus() -> PHAuthorizationStatus {
+        PHPhotoLibrary.authorizationStatus(for: .readWrite)
+    }
+
+    /// Every image taken after `date`, newest first — the rescan's candidate set.
+    nonisolated func fetchAssets(since date: Date) -> [PHAsset] {
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.predicate = NSPredicate(format: "creationDate > %@", date as NSDate)
+        let result = PHAsset.fetchAssets(with: .image, options: options)
+        var assets: [PHAsset] = []
+        assets.reserveCapacity(result.count)
+        result.enumerateObjects { asset, _, _ in assets.append(asset) }
+        return assets
+    }
+
     /// Nonisolated so multiple callers can request images concurrently.
     /// Every call has an internal timeout — after `timeoutSeconds` we abandon the
     /// PHImageManager request and return nil. This prevents stuck iCloud assets from

@@ -21,6 +21,19 @@ struct IdentityDiscoveryResult {
     let matches: [FriendPhotoMatch]    // every input photo the identity was found in
 }
 
+/// One photo a rescan found the friend in. Plain values so it can cross actors.
+struct FoundFace: Sendable {
+    let assetID: String
+    let faceBoundingBox: CGRect   // Vision-normalized bbox (y-up, origin bottom-left)
+}
+
+struct FriendSearchResult: Sendable {
+    let found: [FoundFace]
+    let resolvedIDs: Set<String>   // image loaded and was checked, match or not
+    let unloadedIDs: [String]      // image didn't load (e.g. iCloud-only on a local pass)
+    let completed: Bool            // false if cancelled before every asset was checked
+}
+
 // MARK: - Service
 
 actor FaceMatchingService {
@@ -304,6 +317,119 @@ actor FaceMatchingService {
         }
         guard let image, let cgImage = normalizeOrientation(image).cgImage else { return [] }
         return embedAllFaces(in: cgImage, model: model)
+    }
+
+    // MARK: - Rescan (find a known friend in new photos)
+    //
+    // Unlike discovery there's nothing to cluster: each photo's faces are compared
+    // straight against the friend's stored identity. `allowNetwork` is used exactly
+    // as given — no inline iCloud fallback — so a local pass never stalls on a
+    // download; photos that don't load come back in `unloadedIDs` for a later pass.
+    func findFriend(
+        identity: [FaceEmbedding],
+        in assets: [PHAsset],
+        allowNetwork: Bool,
+        onMatch: (@Sendable (FoundFace) -> Void)? = nil
+    ) async -> FriendSearchResult {
+        let model = mlModel
+        var found: [FoundFace] = []
+        var resolved: Set<String> = []
+        var unloaded: [String] = []
+        var cancelled = false
+
+        // 3 workers, same reasoning as discoverFriendIdentity — do not raise.
+        await withTaskGroup(of: (String, AssetSearch).self) { group in
+            var iterator = assets.makeIterator()
+            var pending = 0
+            while pending < 3, let asset = iterator.next() {
+                group.addTask {
+                    (asset.localIdentifier, await Self.searchAsset(asset, identity: identity, model: model, allowNetwork: allowNetwork))
+                }
+                pending += 1
+            }
+            for await (assetID, result) in group {
+                pending -= 1
+                switch result {
+                case .unloaded:
+                    unloaded.append(assetID)
+                case .noMatch:
+                    resolved.insert(assetID)
+                case .match(let box):
+                    resolved.insert(assetID)
+                    let face = FoundFace(assetID: assetID, faceBoundingBox: box)
+                    found.append(face)
+                    onMatch?(face)
+                }
+                if Task.isCancelled {
+                    cancelled = true
+                    group.cancelAll()
+                    break
+                }
+                if let next = iterator.next() {
+                    group.addTask {
+                        (next.localIdentifier, await Self.searchAsset(next, identity: identity, model: model, allowNetwork: allowNetwork))
+                    }
+                    pending += 1
+                }
+            }
+        }
+
+        Self.logger.info("Rescan pass (network=\(allowNetwork)): \(assets.count) photos, \(found.count) matches, \(unloaded.count) not loaded, cancelled=\(cancelled)")
+        return FriendSearchResult(found: found, resolvedIDs: resolved, unloadedIDs: unloaded, completed: !cancelled)
+    }
+
+    private enum AssetSearch: Sendable {
+        case unloaded
+        case noMatch
+        case match(CGRect)
+    }
+
+    private nonisolated static func searchAsset(
+        _ asset: PHAsset,
+        identity: [FaceEmbedding],
+        model: MLModel,
+        allowNetwork: Bool
+    ) async -> AssetSearch {
+        guard let image = await PhotoLibraryService.shared.loadImage(
+            for: asset, targetSize: CGSize(width: 1024, height: 1024), allowNetwork: allowNetwork
+        ), let cgImage = normalizeOrientation(image).cgImage else { return .unloaded }
+
+        var bestBox: CGRect? = nil
+        var bestSim = matchThreshold
+        for (embedding, box) in embedAllFaces(in: cgImage, model: model) {
+            let sim = identity.map { cosine($0, embedding) }.max() ?? 0
+            if sim >= bestSim {
+                bestSim = sim
+                bestBox = box
+            }
+        }
+        return bestBox.map { .match($0) } ?? .noMatch
+    }
+
+    /// Rebuilds a friend's identity from photos they're already known to be in:
+    /// in each one, the embedded face sitting where the stored box says the friend
+    /// is. Used once for friends saved before identities were persisted.
+    func embedKnownFaces(_ known: [(asset: PHAsset, box: CGRect)], limit: Int = 3) async -> [FaceEmbedding] {
+        let model = mlModel
+        var identity: [FaceEmbedding] = []
+        for (asset, box) in known {
+            guard identity.count < limit, !Task.isCancelled else { break }
+            let faces = await Self.embedFacesInAsset(asset, model: model)
+            let best = faces.max { Self.overlap($0.box, box) < Self.overlap($1.box, box) }
+            if let best, Self.overlap(best.box, box) > 0.5 {
+                identity.append(best.embedding)
+            }
+        }
+        return identity
+    }
+
+    /// Intersection-over-union of two normalized boxes.
+    private static func overlap(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        let inter = a.intersection(b)
+        guard !inter.isNull else { return 0 }
+        let interArea = inter.width * inter.height
+        let union = a.width * a.height + b.width * b.height - interArea
+        return union > 0 ? interArea / union : 0
     }
 
     // MARK: Cover-photo verification

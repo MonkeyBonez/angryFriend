@@ -1,4 +1,6 @@
 struct FaceEmbedding: Sendable {
+    static let dimension = 512
+
     let vector: [Float]  // 512-dim, L2-normalized
 
     func cosineSimilarity(to other: FaceEmbedding) -> Float {

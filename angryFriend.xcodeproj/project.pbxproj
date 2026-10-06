@@ -256,7 +256,7 @@
 				DEVELOPMENT_TEAM = FMDJTXM4W7;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "We need access to your photos to find your friend.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Allow access to all photos so angryFriend can keep finding new pictures of your friends for the game. Everything happens on your phone. Your photos are never uploaded or shared.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -289,7 +289,7 @@
 				DEVELOPMENT_TEAM = FMDJTXM4W7;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "We need access to your photos to find your friend.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Allow access to all photos so angryFriend can keep finding new pictures of your friends for the game. Everything happens on your phone. Your photos are never uploaded or shared.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
