@@ -1,12 +1,15 @@
 import UIKit
 import Photos
 import SwiftData
+import os
 
 /// A friend's cover sticker is a cutout, and it has to stay see-through: the
 /// carousel and detail screen show the pastel tile through it, the same way a
 /// game card does. JPEG has no alpha and flattens that background to black, which
 /// is what the first covers were saved as — hence the repair pass below.
 enum CoverSticker {
+    private static let logger = Logger(subsystem: "com.angryFriend", category: "Cutout")
+
     /// Longest side kept in storage. The sticker is shown at 138pt at most.
     private static let storedSide: CGFloat = 600
 
@@ -34,12 +37,21 @@ enum CoverSticker {
     /// setup, cover picking and the repair pass. Tries the local copy first.
     static func cutout(asset: PHAsset, box: CGRect) async -> UIImage? {
         let targetSize = CGSize(width: 1024, height: 1024)
+        let started = Date()
+        var downloaded = false
         var image = await PhotoLibraryService.shared.loadImage(for: asset, targetSize: targetSize, allowNetwork: false)
         if image == nil {
+            downloaded = true
             image = await PhotoLibraryService.shared.loadImage(for: asset, targetSize: targetSize, allowNetwork: true)
         }
-        guard let image else { return nil }
-        return await SubjectExtractionService.shared.extractSubject(from: image, faceBoundingBox: box)
+        let loaded = Date()
+        guard let image else {
+            logger.warning("Cutout \(asset.localIdentifier.prefix(8)): couldn't load (\(downloaded ? "iCloud" : "local"))")
+            return nil
+        }
+        let cutout = await SubjectExtractionService.shared.extractSubject(from: image, faceBoundingBox: box)
+        logger.info("Cutout \(asset.localIdentifier.prefix(8)): \(downloaded ? "iCloud" : "on phone") load \(Int(loaded.timeIntervalSince(started) * 1000))ms, cut \(Int(Date().timeIntervalSince(loaded) * 1000))ms")
+        return cutout
     }
 
     private static var repaired = false
