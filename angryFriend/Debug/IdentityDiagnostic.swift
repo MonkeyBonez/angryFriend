@@ -81,6 +81,11 @@ enum IdentityDiagnostic {
             }
             var counts: [String: Int] = ["OK": 0, "CLOSE": 0, "WRONG": 0, "LOW": 0, "NOFACE": 0]
             var wrongIDs: [String] = []
+            // Which stored identity face carries each album photo? A face that carries many
+            // photos the other stored faces don't recognise at all is probably someone else.
+            var support = [Int](repeating: 0, count: identities[fi].count)
+            var weakSupport = [Int](repeating: 0, count: identities[fi].count)
+            var weakIDs = [[String]](repeating: [], count: identities[fi].count)
             for job in jobs {
                 let match = matches[job.index]
                 let id8 = String(match.assetID.prefix(8))
@@ -89,7 +94,13 @@ enum IdentityDiagnostic {
                     logger.info("Diag photo \(names[fi]) \(id8) face \(job.faceWidth)px → NOFACE")
                     continue
                 }
-                let own = identities[fi].map { $0.cosineSimilarity(to: embedding) }.max() ?? 0
+                let ownEach = identities[fi].map { $0.cosineSimilarity(to: embedding) }
+                let own = ownEach.max() ?? 0
+                if let k = ownEach.indices.max(by: { ownEach[$0] < ownEach[$1] }) {
+                    support[k] += 1
+                    let rest = ownEach.enumerated().filter { $0.offset != k }.map(\.element).max() ?? 0
+                    if rest < 0.2 { weakSupport[k] += 1; if weakIDs[k].count < 12 { weakIDs[k].append(id8) } }
+                }
                 var otherName = "-", otherSim: Float = -1
                 for (gi, g) in identities.enumerated() where gi != fi {
                     let s = g.map { $0.cosineSimilarity(to: embedding) }.max() ?? -1
@@ -102,10 +113,13 @@ enum IdentityDiagnostic {
                 else { verdict = "OK" }
                 counts[verdict, default: 0] += 1
                 if verdict == "WRONG" { wrongIDs.append(id8) }
-                logger.info("Diag photo \(names[fi]) \(id8) face \(job.faceWidth)px own \(fmt(own)) other \(otherName) \(fmt(otherSim)) → \(verdict)")
+                logger.info("Diag photo \(names[fi]) \(id8) face \(job.faceWidth)px own \(ownEach.map(fmt).joined(separator: "/")) other \(otherName) \(fmt(otherSim)) → \(verdict)")
             }
             let countText = counts.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: ", ")
             logger.info("Diag album \(names[fi]): \(matches.count) photos (\(missing) not in library) — \(countText); WRONG: \(wrongIDs.joined(separator: " "))")
+            for k in support.indices {
+                logger.info("Diag support \(names[fi]) face #\(k): carries \(support[k]) photos, \(weakSupport[k]) of them unrecognised (<0.2) by the other stored faces: \(weakIDs[k].joined(separator: " "))")
+            }
         }
         logger.info("Diag done")
     }
