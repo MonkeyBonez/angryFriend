@@ -53,3 +53,6 @@ debug_chips/
 marketing/appstore-screenshots/shots/
 marketing/appstore-screenshots/final/
 marketing/appstore-screenshots/_*.html
+
+# faceeval harness outputs (face chips, embeddings)
+scripts/faceeval/out/

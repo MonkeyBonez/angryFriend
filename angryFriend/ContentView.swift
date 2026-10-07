@@ -103,6 +103,7 @@ struct ContentView: View {
         .animation(.spring(response: 0.38, dampingFraction: 0.85), value: appState.screen)
         #if DEBUG
         .task { await ScanTestSeed.runIfRequested(context: angryFriendApp.container.mainContext) }
+        .task { await IdentityDiagnostic.runIfRequested(context: angryFriendApp.container.mainContext) }
         #endif
         .onChange(of: scenePhase) { _, phase in
             switch phase {
