@@ -79,7 +79,10 @@ enum ModelComparison {
             }
             // Very large albums: the first 24 (the identity's source) plus an even sample, 600 in all.
             var indices = Array(matches.indices)
-            if indices.count > 800 {
+            // `-recentOnly`: the identity's source plus the newest 150 — what a scan just added.
+            if ProcessInfo.processInfo.arguments.contains("-recentOnly") {
+                indices = Array(Set(indices.prefix(24)).union(indices.suffix(150))).sorted()
+            } else if indices.count > 800 {
                 let rest = Array(indices.dropFirst(24))
                 let step = Double(rest.count) / 576
                 indices = Array(indices.prefix(24)) + (0..<576).map { rest[Int(Double($0) * step)] }
