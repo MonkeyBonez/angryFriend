@@ -196,7 +196,7 @@ private struct FriendDetailContent: View {
         appState.usedPhotoIDs = []
         appState.viewingFriend = nil
         appState.isPickingCoverPhoto = false
-        appState.rescanner.start(for: friend, context: modelContext)
+        appState.rescanner.ensureRunning()
         appState.screen = .processing
     }
 
@@ -215,9 +215,6 @@ private struct FriendDetailContent: View {
     private func deleteFriend() {
         if appState.currentFriend?.id == friend.id {
             appState.currentFriend = nil
-        }
-        if appState.rescanner.friendID == friend.id {
-            appState.rescanner.cancel()
         }
         modelContext.delete(friend)
         try? modelContext.save()

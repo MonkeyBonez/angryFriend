@@ -292,8 +292,13 @@ private struct FriendAlbumContent: View {
         }
 
         isProcessingAdd = true
+        let rescanner = appState.rescanner
+        rescanner.beginHold()
         Task {
-            defer { isProcessingAdd = false }
+            defer {
+                isProcessingAdd = false
+                rescanner.endHold()
+            }
 
             let newFetch = PHAsset.fetchAssets(withLocalIdentifiers: newIDs, options: nil)
             var newAssets: [PHAsset] = []

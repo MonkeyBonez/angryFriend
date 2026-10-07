@@ -256,6 +256,7 @@
 				DEVELOPMENT_TEAM = FMDJTXM4W7;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "angryFriend-Info.plist";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Allow access to all photos so angryFriend can keep finding new pictures of your friends for the game. Everything happens on your phone. Your photos are never uploaded or shared.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -289,6 +290,7 @@
 				DEVELOPMENT_TEAM = FMDJTXM4W7;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "angryFriend-Info.plist";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Allow access to all photos so angryFriend can keep finding new pictures of your friends for the game. Everything happens on your phone. Your photos are never uploaded or shared.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;

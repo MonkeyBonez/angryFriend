@@ -23,7 +23,7 @@ final class AppState {
     var isDemoRound: Bool = false          // the cards on the table are emoji, not a friend
     var pendingAddFriend: Bool = false     // Home should open the add-friend flow as soon as it appears
 
-    let rescanner = FriendRescanner()      // finds new photos of the friend being played, in the background
+    let rescanner = FriendRescanner.shared // finds saved friends in the rest of the library, in the background
     let confetti = ConfettiClock()         // one clock so the background dots carry on across screens
 
     /// Deals a grid of emoji faces and goes straight to the table — there's
@@ -52,6 +52,7 @@ enum AppScreen {
 
 struct ContentView: View {
     @State private var appState = AppState()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
@@ -100,6 +101,21 @@ struct ContentView: View {
         }
         .environment(appState)
         .animation(.spring(response: 0.38, dampingFraction: 0.85), value: appState.screen)
+        #if DEBUG
+        .task { await ScanTestSeed.runIfRequested(context: angryFriendApp.container.mainContext) }
+        #endif
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .active:
+                // Back from the background: carry on where the scan stopped, and
+                // look at whatever was taken in the meantime.
+                appState.rescanner.ensureRunning()
+            case .background:
+                appState.rescanner.appDidEnterBackground()
+            default:
+                break
+            }
+        }
         // The identity commits to the yellow sheet, so system chrome (alerts,
         // dialogs, the photo picker) stays light regardless of device setting.
         .preferredColorScheme(.light)

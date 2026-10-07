@@ -33,10 +33,8 @@ final class Friend {
     var stickerData: Data = Data()          // JPEG cover cutout — just this person, no one else
     var photoMatches: [PhotoMatch] = [PhotoMatch]()  // every photo this friend was found in — picked or found by rescan
     var identityData: Data? = nil           // up to 3 face embeddings, flat [Float] bytes — what a rescan matches against
-    var lastScannedAt: Date? = nil          // camera roll is checked for photos newer than this; nil → createdAt
-    var pendingCloudIDs: [String] = [String]()  // new photos with no local copy yet — the iCloud pass picks these up
-    var backfillBefore: Date? = nil         // older photos are checked back from here; nil → createdAt
-    var backfillDone: Bool = false          // the whole library before createdAt has been checked
+    var catchUpBefore: Date? = nil          // own walk back through photos the shared walk passed before this friend joined
+    var catchUpFloor: Date? = nil           // ...down to here, where the shared walk was; nil → not joined the scan yet
     var excludedIDs: [String] = [String]()  // removed from the album on purpose — a rescan must never add them back
 
     init(name: String, stickerData: Data, photoMatches: [PhotoMatch]) {
@@ -49,6 +47,12 @@ final class Friend {
 }
 
 extension Friend {
+    /// Still has photos the shared walk passed before they joined.
+    var needsCatchUp: Bool {
+        guard let catchUpBefore, let catchUpFloor else { return false }
+        return catchUpBefore > catchUpFloor
+    }
+
     /// The friend's face, as stored in `identityData`. Empty for friends saved
     /// before rescanning existed — the rescanner derives and stores it once.
     var identity: [FaceEmbedding] {

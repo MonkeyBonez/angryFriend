@@ -191,6 +191,12 @@ struct ProcessingView: View {
     /// New friend: discover who the recurring person is across ALL picked photos,
     /// then extract cutouts for this round and save the friend's full album.
     private func runNewFriend() async {
+        // Identifying and snipping get the phone to themselves; the background
+        // scan picks up again (including this friend) once the game starts.
+        let rescanner = appState.rescanner
+        rescanner.beginHold()
+        defer { rescanner.endHold() }
+
         let identifiers = appState.pendingPhotoIDs
         let fetched = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
         var assets: [PHAsset] = []
@@ -257,11 +263,11 @@ struct ProcessingView: View {
             stickerData: coverImage.flatMap(CoverSticker.encode) ?? Data(),
             photoMatches: discovery.matches.map { PhotoMatch(assetID: $0.asset.localIdentifier, faceBoundingBox: $0.faceBoundingBox) }
         )
-        // What later rescans match new photos against, and where they start from.
+        // What the background scan matches the rest of the library against.
         friend.identity = discovery.identity
-        friend.lastScannedAt = Date()
         modelContext.insert(friend)
         try? modelContext.save()
+        rescanner.ensureRunning()
         appState.currentFriend = friend
         appState.pendingPhotoIDs = []
 
@@ -274,16 +280,28 @@ struct ProcessingView: View {
     private func runReplay(for friend: Friend) async {
         let needed = appState.cardCount
 
-        // Not enough photos for a full grid yet: give the rescan a chance to find
-        // more before dealing. Once there are enough the game starts and the scan
-        // carries on behind it.
+        let rescanner = appState.rescanner
+
+        // Not enough photos for a full grid yet: give the scan a chance to find
+        // more before dealing — focused on this friend while we wait. Once there
+        // are enough the game starts and the scan carries on behind it.
+        if friend.photoMatches.count < needed {
+            rescanner.focusFriendID = friend.id
+            rescanner.ensureRunning()
+        }
+        defer { if rescanner.focusFriendID == friend.id { rescanner.focusFriendID = nil } }
         while friend.photoMatches.count < needed,
-              appState.rescanner.isScanning(for: friend),
+              rescanner.couldStillAdd(to: friend),
               !playWithWhatWeHave {
             phase = .findingPhotos(friend.photoMatches.count, needed)
             try? await Task.sleep(for: .milliseconds(250))
             guard Task.isCancelled == false else { return }
         }
+        if rescanner.focusFriendID == friend.id { rescanner.focusFriendID = nil }
+
+        // Snipping gets the phone to itself; the scan waits within a photo.
+        rescanner.beginHold()
+        defer { rescanner.endHold() }
 
         let available = friend.photoMatches.filter { !appState.usedPhotoIDs.contains($0.assetID) }
         let source = available.count >= needed ? available : friend.photoMatches
@@ -313,6 +331,8 @@ struct ProcessingView: View {
         }
 
         phase = .extracting(0, pairs.count)
+        let started = Date()
+        defer { logger.info("Cut out \(pairs.count) photos in \(String(format: "%.1f", Date().timeIntervalSince(started)))s") }
         let extracted = await Self.extractAll(pairs) { done, total, image in
             Task { @MainActor in
                 self.phase = .extracting(done, total)

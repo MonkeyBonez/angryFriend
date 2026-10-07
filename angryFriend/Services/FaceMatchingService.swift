@@ -27,11 +27,24 @@ struct FoundFace: Sendable {
     let faceBoundingBox: CGRect   // Vision-normalized bbox (y-up, origin bottom-left)
 }
 
-struct FriendSearchResult: Sendable {
-    let found: [FoundFace]
-    let resolvedIDs: Set<String>   // image loaded and was checked, match or not
-    let unloadedIDs: [String]      // image didn't load (e.g. iCloud-only on a local pass)
-    let completed: Bool            // false if cancelled before every asset was checked
+/// What a background-scan search turned up across a batch of photos.
+nonisolated struct FriendsSearchResult: Sendable {
+    var found: [UUID: [FoundFace]] = [:]   // per friend
+    var checkedIDs: Set<String> = []       // looked at properly: matched or ruled out
+    var cloudIDs: [String] = []            // original only in iCloud, and the copy here wasn't enough to rule it out
+    var failedIDs: [String] = []           // didn't load at all
+    var completed = true                   // false if stopped before every photo was looked at
+}
+
+/// One photo for the scan to check, and which friends to check it against.
+nonisolated struct ScanCandidate: @unchecked Sendable {
+    let asset: PHAsset
+    let friendIDs: [UUID]
+}
+
+nonisolated enum ScanMode: Sendable {
+    case local      // the library walk: downloads iCloud-only photos inline when online
+    case download   // retrying photos queued for iCloud
 }
 
 // MARK: - Service
@@ -58,7 +71,7 @@ actor FaceMatchingService {
 
     // MARK: Orientation normalization
 
-    private static func normalizeOrientation(_ image: UIImage) -> UIImage {
+    private nonisolated static func normalizeOrientation(_ image: UIImage) -> UIImage {
         guard image.imageOrientation != .up else { return image }
         return UIGraphicsImageRenderer(size: image.size).image { _ in image.draw(at: .zero) }
     }
@@ -186,8 +199,20 @@ actor FaceMatchingService {
     ) -> [(embedding: FaceEmbedding, box: CGRect)] {
         autoreleasepool {
             let req = VNDetectFaceLandmarksRequest()
+            #if targetEnvironment(simulator)
+            // No Neural Engine in the Simulator: "Could not create inference context".
+            if let cpu = MLComputeDevice.allComputeDevices.first(where: { if case .cpu = $0 { true } else { false } }) {
+                req.setComputeDevice(cpu, for: .main)
+            }
+            #endif
             let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-            guard (try? handler.perform([req])) != nil, let faces = req.results else { return [] }
+            do {
+                try handler.perform([req])
+            } catch {
+                logger.error("Face detection failed: \(error.localizedDescription)")
+                return []
+            }
+            guard let faces = req.results else { return [] }
 
             var results: [(embedding: FaceEmbedding, box: CGRect)] = []
             for face in faces {
@@ -202,8 +227,46 @@ actor FaceMatchingService {
         }
     }
 
-    private static func cosine(_ a: FaceEmbedding, _ b: FaceEmbedding) -> Float {
+    private nonisolated static func cosine(_ a: FaceEmbedding, _ b: FaceEmbedding) -> Float {
         zip(a.vector, b.vector).reduce(0) { $0 + $1.0 * $1.1 }
+    }
+
+    // MARK: Off the cooperative pool
+    //
+    // `VNImageRequestHandler.perform` and `MLModel.prediction` block their thread.
+    // Run on Swift's cooperative pool (~1 thread per core) they starve it — of
+    // the threads Vision needs internally (8 workers once deadlocked a 6-core
+    // phone) and of the threads the UI's own async work runs on. So the blocking
+    // part runs on its own GCD queue, at the QoS of whoever asked: the background
+    // scan at utility, identity discovery at user-initiated.
+
+    private nonisolated static let visionQueue = DispatchQueue(
+        label: "com.angryFriend.vision", qos: .utility, attributes: .concurrent
+    )
+
+    private nonisolated static func embedOffPool(
+        _ image: UIImage,
+        model: MLModel,
+        qos: DispatchQoS
+    ) async -> [(embedding: FaceEmbedding, box: CGRect)] {
+        await withCheckedContinuation { cont in
+            visionQueue.async(qos: qos, flags: .enforceQoS) {
+                guard let cgImage = normalizeOrientation(image).cgImage else {
+                    cont.resume(returning: [])
+                    return
+                }
+                cont.resume(returning: embedAllFaces(in: cgImage, model: model))
+            }
+        }
+    }
+
+    /// The caller's priority, as a GCD QoS.
+    private nonisolated static var currentQoS: DispatchQoS {
+        switch Task.currentPriority {
+        case .high, .userInitiated: return .userInitiated
+        case .medium: return .default
+        default: return .utility
+        }
     }
 
     // MARK: - Dominant identity discovery (the core of "pick photos yourself")
@@ -315,95 +378,169 @@ actor FaceMatchingService {
                 for: asset, targetSize: targetSize, allowNetwork: true
             )
         }
-        guard let image, let cgImage = normalizeOrientation(image).cgImage else { return [] }
-        return embedAllFaces(in: cgImage, model: model)
+        guard let image else { return [] }
+        return await embedOffPool(image, model: model, qos: .userInitiated)
     }
 
-    // MARK: - Rescan (find a known friend in new photos)
+    // MARK: - Background scan (find saved friends in the library)
     //
-    // Unlike discovery there's nothing to cluster: each photo's faces are compared
-    // straight against the friend's stored identity. `allowNetwork` is used exactly
-    // as given — no inline iCloud fallback — so a local pass never stalls on a
-    // download; photos that don't load come back in `unloadedIDs` for a later pass.
-    func findFriend(
-        identity: [FaceEmbedding],
-        in assets: [PHAsset],
-        allowNetwork: Bool,
-        onMatch: (@Sendable (FoundFace) -> Void)? = nil
-    ) async -> FriendSearchResult {
+    // Nothing to cluster: each photo is loaded once, its faces embedded once, and
+    // every face compared against each friend the photo is being checked for.
+    // A photo whose original is only in iCloud is downloaded on the spot when
+    // the phone is online. Offline, the copy already on the phone is checked
+    // instead, and the photo queued for a download if that copy is too small to
+    // trust or shows faces that didn't match.
+
+    /// Shortest side a local iCloud stand-in must have before a "no match" on it
+    /// is trusted. Small renditions still find faces, but a friend in the
+    /// background of one is too few pixels to recognise.
+    nonisolated static let minTriageSide = 480
+
+    func findFriends(
+        identities: [UUID: [FaceEmbedding]],
+        in candidates: [ScanCandidate],
+        mode: ScanMode,
+        control: ScanControl,
+        onMatch: @escaping @Sendable (UUID, FoundFace) -> Void
+    ) async -> FriendsSearchResult {
         let model = mlModel
-        var found: [FoundFace] = []
-        var resolved: Set<String> = []
-        var unloaded: [String] = []
-        var cancelled = false
+        let qos = Self.currentQoS
+        var result = FriendsSearchResult()
+        var stopped = false
 
-        // 3 workers, same reasoning as discoverFriendIdentity — do not raise.
-        await withTaskGroup(of: (String, AssetSearch).self) { group in
-            var iterator = assets.makeIterator()
-            var pending = 0
-            while pending < 3, let asset = iterator.next() {
-                group.addTask {
-                    (asset.localIdentifier, await Self.searchAsset(asset, identity: identity, model: model, allowNetwork: allowNetwork))
-                }
-                pending += 1
-            }
-            for await (assetID, result) in group {
-                pending -= 1
-                switch result {
-                case .unloaded:
-                    unloaded.append(assetID)
-                case .noMatch:
-                    resolved.insert(assetID)
-                case .match(let box):
-                    resolved.insert(assetID)
-                    let face = FoundFace(assetID: assetID, faceBoundingBox: box)
-                    found.append(face)
-                    onMatch?(face)
-                }
-                if Task.isCancelled {
-                    cancelled = true
-                    group.cancelAll()
-                    break
-                }
-                if let next = iterator.next() {
-                    group.addTask {
-                        (next.localIdentifier, await Self.searchAsset(next, identity: identity, model: model, allowNetwork: allowNetwork))
+        await withTaskGroup(of: (String, AssetCheck).self) { group in
+            var iterator = candidates.makeIterator()
+            var running = 0
+            var exhausted = false
+
+            while true {
+                // Keep `workers` photos in flight. A hold (snipping, identifying)
+                // or a hot phone stops new photos from starting; the ones already
+                // going finish, so the scan yields within about one photo.
+                while running < control.workers, !exhausted, !stopped {
+                    if control.isStopped || Task.isCancelled { stopped = true; break }
+                    if control.mustWait {
+                        if running > 0 { break }
+                        try? await Task.sleep(for: .milliseconds(300))
+                        continue
                     }
-                    pending += 1
+                    guard let candidate = iterator.next() else { exhausted = true; break }
+                    group.addTask {
+                        (candidate.asset.localIdentifier,
+                         await Self.check(candidate, identities: identities, mode: mode, model: model, qos: qos))
+                    }
+                    running += 1
+                }
+                guard running > 0, let (assetID, check) = await group.next() else { break }
+                running -= 1
+
+                switch check {
+                case .checked(let matches, let needsDownload):
+                    for (friendID, box) in matches {
+                        let face = FoundFace(assetID: assetID, faceBoundingBox: box)
+                        result.found[friendID, default: []].append(face)
+                        onMatch(friendID, face)
+                    }
+                    if needsDownload {
+                        result.cloudIDs.append(assetID)
+                    } else {
+                        result.checkedIDs.insert(assetID)
+                    }
+                case .failed:
+                    result.failedIDs.append(assetID)
                 }
             }
         }
 
-        Self.logger.info("Rescan pass (network=\(allowNetwork)): \(assets.count) photos, \(found.count) matches, \(unloaded.count) not loaded, cancelled=\(cancelled)")
-        return FriendSearchResult(found: found, resolvedIDs: resolved, unloadedIDs: unloaded, completed: !cancelled)
+        result.completed = !stopped
+        let matched = result.found.values.reduce(0) { $0 + $1.count }
+        Self.logger.info("Scan batch (\(mode == .local ? "local" : "download")): \(candidates.count) photos, \(matched) matches, \(result.cloudIDs.count) need iCloud, \(result.failedIDs.count) failed\(stopped ? ", stopped early" : "")")
+        return result
     }
 
-    private enum AssetSearch: Sendable {
-        case unloaded
-        case noMatch
-        case match(CGRect)
+    private enum AssetCheck: Sendable {
+        case checked([UUID: CGRect], needsDownload: Bool)
+        case failed
     }
 
-    private nonisolated static func searchAsset(
-        _ asset: PHAsset,
-        identity: [FaceEmbedding],
+    private nonisolated static func check(
+        _ candidate: ScanCandidate,
+        identities: [UUID: [FaceEmbedding]],
+        mode: ScanMode,
         model: MLModel,
-        allowNetwork: Bool
-    ) async -> AssetSearch {
-        guard let image = await PhotoLibraryService.shared.loadImage(
-            for: asset, targetSize: CGSize(width: 1024, height: 1024), allowNetwork: allowNetwork
-        ), let cgImage = normalizeOrientation(image).cgImage else { return .unloaded }
+        qos: DispatchQoS
+    ) async -> AssetCheck {
+        let asset = candidate.asset
+        let library = PhotoLibraryService.shared
 
-        var bestBox: CGRect? = nil
-        var bestSim = matchThreshold
-        for (embedding, box) in embedAllFaces(in: cgImage, model: model) {
-            let sim = identity.map { cosine($0, embedding) }.max() ?? 0
-            if sim >= bestSim {
-                bestSim = sim
-                bestBox = box
+        switch mode {
+        case .download:
+            guard case .loaded(let image) = await library.load(asset, policy: .download(idle: 30, max: 180)) else {
+                return .failed
+            }
+            let faces = await embedOffPool(image, model: model, qos: qos)
+            return .checked(best(faces, for: candidate.friendIDs, identities: identities), needsDownload: false)
+
+        case .local:
+            switch await library.load(asset, policy: .localFull) {
+            case .loaded(let image):
+                let faces = await embedOffPool(image, model: model, qos: qos)
+                return .checked(best(faces, for: candidate.friendIDs, identities: identities), needsDownload: false)
+            case .failed:
+                // Not an iCloud photo, yet it wouldn't load (timed out, busy):
+                // let the download pass have a go, it has retries.
+                return .checked([:], needsDownload: true)
+            case .inCloud:
+                // With "Optimize iPhone Storage" this is most of the library, and
+                // the copy on the phone is a thumbnail too small to trust. Online,
+                // just download it — a 1024px request pulls a derivative, not the
+                // original, and takes a fraction of a second.
+                if NetworkMonitor.shared.isOnline {
+                    guard case .loaded(let image) = await library.load(asset, policy: .download(idle: 20, max: 60)) else {
+                        return .checked([:], needsDownload: true)
+                    }
+                    let faces = await embedOffPool(image, model: model, qos: qos)
+                    return .checked(best(faces, for: candidate.friendIDs, identities: identities), needsDownload: false)
+                }
+                // Offline: rule out what the on-phone copy can, queue the rest.
+                guard case .loaded(let small) = await library.load(asset, policy: .localFast) else {
+                    return .checked([:], needsDownload: true)
+                }
+                let pixels = small.cgImage.map { min($0.width, $0.height) } ?? 0
+                guard pixels >= minTriageSide else {
+                    logger.debug("iCloud photo \(asset.localIdentifier.prefix(8)): local copy \(pixels)px, needs download")
+                    return .checked([:], needsDownload: true)
+                }
+                let faces = await embedOffPool(small, model: model, qos: qos)
+                // No faces at all: nothing to download for.
+                guard !faces.isEmpty else { return .checked([:], needsDownload: false) }
+                let matches = best(faces, for: candidate.friendIDs, identities: identities)
+                // Everyone found: done. Anyone not found might just be too small
+                // in this copy — the full-size one decides.
+                return .checked(matches, needsDownload: matches.count < candidate.friendIDs.count)
             }
         }
-        return bestBox.map { .match($0) } ?? .noMatch
+    }
+
+    /// For each friend, the face that looks most like them, if any clears the bar.
+    private nonisolated static func best(
+        _ faces: [(embedding: FaceEmbedding, box: CGRect)],
+        for friendIDs: [UUID],
+        identities: [UUID: [FaceEmbedding]]
+    ) -> [UUID: CGRect] {
+        var matches: [UUID: CGRect] = [:]
+        for friendID in friendIDs {
+            guard let identity = identities[friendID], !identity.isEmpty else { continue }
+            var bestSim = matchThreshold
+            for (embedding, box) in faces {
+                let sim = identity.map { cosine($0, embedding) }.max() ?? 0
+                if sim >= bestSim {
+                    bestSim = sim
+                    matches[friendID] = box
+                }
+            }
+        }
+        return matches
     }
 
     /// Rebuilds a friend's identity from photos they're already known to be in:

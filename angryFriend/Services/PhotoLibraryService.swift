@@ -2,11 +2,14 @@ import Photos
 import UIKit
 import os
 
-// Thread-safe once-only resolution token. Used by loadImage to race the PHImageManager
-// callback against a timeout without waiting for PHImageManager to actually cancel.
-private final class ResultBox: @unchecked Sendable {
+/// Races a PHImageManager request against its deadlines. The request settles
+/// exactly once — the image callback or the watchdog, whichever claims first.
+private nonisolated final class LoadWatch: @unchecked Sendable {
     private let lock = NSLock()
     private var resolved = false
+    private var lastProgress = Date()
+    let started = Date()
+    var requestID: PHImageRequestID = PHInvalidImageRequestID
 
     func claim() -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -14,18 +17,47 @@ private final class ResultBox: @unchecked Sendable {
         resolved = true
         return true
     }
+
+    var isResolved: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return resolved
+    }
+
+    /// The download moved — push the idle deadline back.
+    func touch() {
+        lock.lock(); defer { lock.unlock() }
+        lastProgress = Date()
+    }
+
+    var idleFor: TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return Date().timeIntervalSince(lastProgress)
+    }
 }
 
-// Mutable request-ID box, so the timeout task can read the ID the PHImageManager
-// call produced (value is set synchronously before the timeout could possibly fire).
-private final class RequestIDBox: @unchecked Sendable {
-    var id: PHImageRequestID = PHInvalidImageRequestID
+/// How hard to try for a photo.
+nonisolated enum LoadPolicy: Sendable {
+    /// Full size, this device only. Reports `.inCloud` when the original isn't here.
+    case localFull
+    /// Whatever rendition is already on the device, however small — for photos
+    /// whose original is in iCloud. No download.
+    case localFast
+    /// Full size, downloading from iCloud if needed. Gives up after `idle`
+    /// seconds without progress, or `max` seconds in all.
+    case download(idle: TimeInterval, max: TimeInterval)
 }
 
-// Holds the timeout task so the image callback can cancel it on success —
-// otherwise every loadImage call leaves a task sleeping the full 20s.
-private final class TimeoutTaskBox: @unchecked Sendable {
-    var task: Task<Void, Never>?
+nonisolated enum LoadOutcome {
+    case loaded(UIImage)
+    case inCloud    // only in iCloud, and the policy didn't allow a download
+    case failed     // timed out, cancelled, or unreadable
+}
+
+/// One step of a walk through the library: the photos to check, and where the
+/// next step starts. `next == nil` means the walk has reached the end.
+nonisolated struct LibraryStep {
+    let assets: [PHAsset]
+    let next: Date?
 }
 
 actor PhotoLibraryService {
@@ -42,113 +74,174 @@ actor PhotoLibraryService {
 
     // MARK: - What the rescan looks at
 
-    /// Photos worth running face matching on. Out: screenshots and panoramas
-    /// (by subtype), anything under 300px a side (icons, thumbnails, stickers).
-    /// Videos are out by media type; hidden photos and the extra frames of a
-    /// burst are out by `PHFetchOptions` defaults. Animated images can't be
-    /// filtered in the predicate — see `isScannable`.
-    private nonisolated static let scanFilter = NSCompoundPredicate(andPredicateWithSubpredicates: [
-        NSPredicate(format: "(mediaSubtypes & %d) == 0",
-                    PHAssetMediaSubtype.photoScreenshot.rawValue | PHAssetMediaSubtype.photoPanorama.rawValue),
-        NSPredicate(format: "pixelWidth >= 300 AND pixelHeight >= 300"),
-    ])
+    /// Photos worth running face matching on. Out: anything under 300px a side
+    /// (icons, thumbnails, stickers) by predicate; screenshots, panoramas and
+    /// animated images in `isScannable`. Videos are out by media type; hidden
+    /// photos and the extra frames of a burst by `PHFetchOptions` defaults.
+    private nonisolated static let scanFilter = NSPredicate(format: "pixelWidth >= 300 AND pixelHeight >= 300")
+
+    /// Subtypes can't go in the predicate: PhotoKit gets `(mediaSubtypes & x) == 0`
+    /// wrong — on a test library it matched 1 photo of 178, the one with a bit set.
+    private nonisolated static let skippedSubtypes: PHAssetMediaSubtype = [.photoScreenshot, .photoPanorama]
 
     private nonisolated static func isScannable(_ asset: PHAsset) -> Bool {
         asset.playbackStyle != .imageAnimated   // GIFs
+            && asset.mediaSubtypes.isDisjoint(with: skippedSubtypes)
     }
 
-    /// Returns the scannable assets plus the oldest shot date in the raw fetch,
-    /// so a caller walking backwards can step past a run of GIFs.
-    private nonisolated func fetchScannable(_ predicate: NSPredicate, limit: Int = 0) -> (assets: [PHAsset], oldestFetched: Date?) {
+    private nonisolated func fetch(_ predicate: NSPredicate, sortKey: String, ascending: Bool, limit: Int = 0) -> PHFetchResult<PHAsset> {
         let options = PHFetchOptions()
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.sortDescriptors = [NSSortDescriptor(key: sortKey, ascending: ascending)]
         options.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [predicate, Self.scanFilter])
         options.fetchLimit = limit
-        let result = PHAsset.fetchAssets(with: .image, options: options)
+        return PHAsset.fetchAssets(with: .image, options: options)
+    }
+
+    /// Photos within a millisecond of each other count as a tie: a step always
+    /// takes the whole tie group at its edge, then steps this far past it.
+    private nonisolated static let tieWindow: TimeInterval = 0.001
+
+    /// Back through the library by shot date: up to `limit` photos shot before
+    /// `cursor` (and not before `floor`), newest first, plus every photo sharing
+    /// the oldest one's timestamp — so a "Save all" of 300 photos stamped with
+    /// the same second is taken in one go instead of looping or being skipped.
+    /// The next cursor is strictly earlier than this one.
+    nonisolated func stepBack(before cursor: Date, floor: Date? = nil, limit: Int) -> LibraryStep {
+        var bounds = [NSPredicate(format: "creationDate < %@", cursor as NSDate)]
+        if let floor { bounds.append(NSPredicate(format: "creationDate >= %@", floor as NSDate)) }
+        let page = fetch(NSCompoundPredicate(andPredicateWithSubpredicates: bounds),
+                         sortKey: "creationDate", ascending: false, limit: limit)
+        guard let edge = page.lastObject?.creationDate else { return LibraryStep(assets: [], next: nil) }
+
+        var ties = [NSPredicate(format: "creationDate >= %@ AND creationDate <= %@",
+                                edge.addingTimeInterval(-Self.tieWindow) as NSDate, edge as NSDate)]
+        if let floor { ties.append(NSPredicate(format: "creationDate >= %@", floor as NSDate)) }
+        let tie = fetch(NSCompoundPredicate(andPredicateWithSubpredicates: ties), sortKey: "creationDate", ascending: false)
+        return LibraryStep(assets: Self.merge(page, tie), next: edge.addingTimeInterval(-Self.tieWindow))
+    }
+
+    /// Forward through the library by when photos last changed: up to `limit`
+    /// photos added or edited after `cursor`, oldest change first, plus the tie
+    /// group at the newest one. Catches new shots and photos saved with an old
+    /// shot date (AirDrop, imports, saved attachments) alike.
+    nonisolated func stepForward(after cursor: Date, limit: Int) -> LibraryStep {
+        // A photo stamped in the future (a camera with its clock wrong) waits
+        // until its time comes, rather than dragging the cursor past real photos.
+        let page = fetch(NSPredicate(format: "modificationDate > %@ AND modificationDate <= %@", cursor as NSDate, Date() as NSDate),
+                         sortKey: "modificationDate", ascending: true, limit: limit)
+        guard let edge = page.lastObject?.modificationDate else { return LibraryStep(assets: [], next: nil) }
+        let tie = fetch(NSPredicate(format: "modificationDate >= %@ AND modificationDate <= %@",
+                                    edge as NSDate, edge.addingTimeInterval(Self.tieWindow) as NSDate),
+                        sortKey: "modificationDate", ascending: true)
+        return LibraryStep(assets: Self.merge(page, tie), next: edge.addingTimeInterval(Self.tieWindow))
+    }
+
+    /// The page and its tie group, deduped, animated images dropped.
+    private nonisolated static func merge(_ page: PHFetchResult<PHAsset>, _ tie: PHFetchResult<PHAsset>) -> [PHAsset] {
+        var seen = Set<String>()
         var assets: [PHAsset] = []
-        assets.reserveCapacity(result.count)
-        result.enumerateObjects { asset, _, _ in
-            if Self.isScannable(asset) { assets.append(asset) }
+        for result in [page, tie] {
+            result.enumerateObjects { asset, _, _ in
+                if seen.insert(asset.localIdentifier).inserted, isScannable(asset) { assets.append(asset) }
+            }
         }
-        return (assets, result.lastObject?.creationDate)
+        return assets
     }
 
-    /// Every image taken after `date`, newest first — the rescan's candidate set.
-    /// Photos that arrived after `date`: taken since then, or saved into the
-    /// library since then with an older shot date (AirDrop, imports, saved
-    /// attachments) — those carry their original creation date but a fresh
-    /// modification date.
-    nonisolated func fetchAssets(since date: Date) -> [PHAsset] {
-        fetchScannable(NSPredicate(format: "creationDate > %@ OR modificationDate > %@", date as NSDate, date as NSDate)).assets
+    /// Photos shot before `cursor` (and not before `floor`) — what a walk has left.
+    nonisolated func count(before cursor: Date, floor: Date? = nil) -> Int {
+        var bounds = [NSPredicate(format: "creationDate < %@", cursor as NSDate)]
+        if let floor { bounds.append(NSPredicate(format: "creationDate >= %@", floor as NSDate)) }
+        return fetch(NSCompoundPredicate(andPredicateWithSubpredicates: bounds), sortKey: "creationDate", ascending: false).count
     }
 
-    /// The next `limit` photos taken before `date`, newest first — one step of
-    /// a backwards walk through the library. Empty only when nothing older is
-    /// left: a chunk that was entirely GIFs is skipped over, not reported.
-    nonisolated func fetchAssets(before date: Date, limit: Int) -> [PHAsset] {
-        var cursor = date
-        while true {
-            let (assets, oldestFetched) = fetchScannable(NSPredicate(format: "creationDate < %@", cursor as NSDate), limit: limit)
-            guard assets.isEmpty, let oldestFetched, oldestFetched < cursor else { return assets }
-            cursor = oldestFetched
+    /// Photos added or edited after `cursor` — what the forward pass has left.
+    nonisolated func count(changedAfter cursor: Date) -> Int {
+        fetch(NSPredicate(format: "modificationDate > %@ AND modificationDate <= %@", cursor as NSDate, Date() as NSDate),
+              sortKey: "modificationDate", ascending: true).count
+    }
+
+    /// Loads one photo under `policy`. Nonisolated so callers can load several
+    /// at once.
+    nonisolated func load(
+        _ asset: PHAsset,
+        targetSize: CGSize = CGSize(width: 1024, height: 1024),
+        policy: LoadPolicy
+    ) async -> LoadOutcome {
+        let watch = LoadWatch()
+        let assetID = asset.localIdentifier
+        let shortID = String(assetID.prefix(8))
+
+        let options = PHImageRequestOptions()
+        options.isSynchronous = false
+        let idle: TimeInterval
+        let limit: TimeInterval
+        switch policy {
+        case .localFull:
+            options.deliveryMode = .highQualityFormat   // one full-size callback, no degraded thumbnail
+            options.resizeMode = .exact
+            options.isNetworkAccessAllowed = false
+            (idle, limit) = (20, 20)
+        case .localFast:
+            options.deliveryMode = .fastFormat
+            options.resizeMode = .fast
+            options.isNetworkAccessAllowed = false
+            (idle, limit) = (10, 10)
+        case .download(let idleTimeout, let maxTimeout):
+            options.deliveryMode = .highQualityFormat
+            options.resizeMode = .exact
+            options.isNetworkAccessAllowed = true
+            // Fires as the download moves; a slow but steady download keeps going.
+            options.progressHandler = { _, _, _, _ in watch.touch() }
+            (idle, limit) = (idleTimeout, maxTimeout)
+        }
+
+        return await withCheckedContinuation { (cont: CheckedContinuation<LoadOutcome, Never>) in
+            watch.requestID = PHImageManager.default().requestImage(
+                for: asset, targetSize: targetSize, contentMode: .aspectFit, options: options
+            ) { image, info in
+                guard watch.claim() else { return }
+                if let image {
+                    cont.resume(returning: .loaded(image))
+                } else if (info?[PHImageResultIsInCloudKey] as? Bool) == true, !options.isNetworkAccessAllowed {
+                    cont.resume(returning: .inCloud)
+                } else {
+                    let err = (info?[PHImageErrorKey] as? NSError)?.localizedDescription ?? "unknown"
+                    PhotoLibraryService.logger.warning("load nil for \(shortID): err=\(err)")
+                    cont.resume(returning: .failed)
+                }
+            }
+
+            // Watchdog: gives up on a request that stalls, or runs too long in all.
+            Task.detached(priority: .utility) {
+                while !watch.isResolved {
+                    try? await Task.sleep(for: .milliseconds(500))
+                    let stalled = watch.idleFor > idle
+                    let tooLong = Date().timeIntervalSince(watch.started) > limit
+                    guard stalled || tooLong else { continue }
+                    guard watch.claim() else { return }
+                    PHImageManager.default().cancelImageRequest(watch.requestID)
+                    PhotoLibraryService.logger.warning("load gave up on \(shortID) after \(Int(Date().timeIntervalSince(watch.started)))s (\(stalled ? "stalled" : "too long"), network=\(options.isNetworkAccessAllowed))")
+                    cont.resume(returning: .failed)
+                    return
+                }
+            }
         }
     }
 
-    /// Nonisolated so multiple callers can request images concurrently.
-    /// Every call has an internal timeout — after `timeoutSeconds` we abandon the
-    /// PHImageManager request and return nil. This prevents stuck iCloud assets from
-    /// blocking extraction or the iCloud scan's workers indefinitely.
+    /// Full-size image, or nil. With `allowNetwork` it downloads from iCloud,
+    /// giving up after `timeoutSeconds` — used where someone is waiting on the
+    /// result (cutouts, identity discovery, the album grid).
     nonisolated func loadImage(
         for asset: PHAsset,
         targetSize: CGSize = CGSize(width: 1024, height: 1024),
         allowNetwork: Bool = false,
-        fastMode: Bool = false,
         timeoutSeconds: Double = 20
     ) async -> UIImage? {
-        let box = ResultBox()
-        let idBox = RequestIDBox()
-        let timeoutBox = TimeoutTaskBox()
-        let assetID = asset.localIdentifier
-
-        return await withCheckedContinuation { (cont: CheckedContinuation<UIImage?, Never>) in
-            let options = PHImageRequestOptions()
-            options.deliveryMode = .highQualityFormat  // single full-res callback, no degraded thumbnail
-            options.resizeMode = fastMode ? .fast : .exact
-            options.isNetworkAccessAllowed = allowNetwork
-            options.isSynchronous = false
-
-            // Kick off the PHImageManager request.
-            idBox.id = PHImageManager.default().requestImage(
-                for: asset,
-                targetSize: targetSize,
-                contentMode: .aspectFit,
-                options: options
-            ) { image, info in
-                // If the timeout already won, discard this result.
-                guard box.claim() else { return }
-
-                // Cancel the pending timeout so it doesn't sleep the full duration.
-                timeoutBox.task?.cancel()
-
-                if image == nil {
-                    let shortID = assetID.prefix(8)
-                    let err = (info?[PHImageErrorKey] as? NSError)?.localizedDescription ?? "unknown"
-                    let isCloud = (info?[PHImageResultIsInCloudKey] as? Bool) ?? false
-                    PhotoLibraryService.logger.warning("loadImage nil for \(shortID): cloud=\(isCloud), err=\(err)")
-                }
-                cont.resume(returning: image)
-            }
-
-            // Start the timeout task. If it wins the race we cancel the PHImageManager
-            // request (best-effort) and resume the continuation ourselves. On the normal
-            // path the image callback cancels this task so it exits immediately.
-            timeoutBox.task = Task.detached(priority: .userInitiated) {
-                try? await Task.sleep(for: .seconds(timeoutSeconds))
-                guard !Task.isCancelled, box.claim() else { return }
-                PHImageManager.default().cancelImageRequest(idBox.id)
-                PhotoLibraryService.logger.warning("loadImage TIMEOUT after \(timeoutSeconds)s for \(assetID.prefix(8)) (network=\(allowNetwork))")
-                cont.resume(returning: nil)
-            }
+        let policy: LoadPolicy = allowNetwork ? .download(idle: timeoutSeconds, max: timeoutSeconds) : .localFull
+        if case .loaded(let image) = await load(asset, targetSize: targetSize, policy: policy) {
+            return image
         }
+        return nil
     }
 }

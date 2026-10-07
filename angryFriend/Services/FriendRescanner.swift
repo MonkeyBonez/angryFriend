@@ -1,55 +1,118 @@
+import BackgroundTasks
 import Foundation
 import Photos
 import SwiftData
 import UIKit
 import os
 
-/// Looks through the camera roll for new photos of a saved friend and grows
-/// their album with what it finds. Runs when a friend is picked to play, and
-/// catches up on every friend when the app comes to the foreground.
+/// Switches the scan's workers read between photos. Thread-safe so they can be
+/// flipped from the main actor while the workers run elsewhere.
+nonisolated final class ScanControl: @unchecked Sendable {
+    private let lock = NSLock()
+    private var held = false
+    private var stopped = false
+
+    func setHeld(_ value: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        held = value
+    }
+
+    func stop() {
+        lock.lock(); defer { lock.unlock() }
+        stopped = true
+    }
+
+    var isStopped: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return stopped
+    }
+
+    /// Don't start another photo yet: the foreground is snipping or identifying,
+    /// or the phone is too hot.
+    var mustWait: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return held || ProcessInfo.processInfo.thermalState == .critical
+    }
+
+    /// Photos in flight at once. One when the phone is warm or saving power.
+    var workers: Int {
+        let info = ProcessInfo.processInfo
+        return info.isLowPowerModeEnabled || info.thermalState == .serious ? 1 : 3
+    }
+}
+
+/// Finds saved friends in the rest of the photo library and grows their albums.
 ///
-/// Order of work: new photos on the device first (fast, no downloads), then the
-/// ones that only exist in iCloud, then a walk back through everything older
-/// than the friend — the whole library, eventually. Lives on `AppState` rather
-/// than in a view so a scan keeps going across the processing screen, the game
-/// and the result. Photos removed from the album by hand (`Friend.excludedIDs`)
-/// are never added back.
+/// One scan serves every friend: each photo is loaded and its faces embedded
+/// once, then compared against everyone it's being checked for. Each round:
 ///
-/// Progress is written to the friend as it happens — every match, and a cursor
-/// after every chunk — so a scan cut short by the app being backgrounded or
-/// killed resumes from where it stopped, never from the start.
+/// 1. New photos — anything added or edited since last time, so a fresh shot
+///    shows up fast.
+/// 2. Three older-photo turns: two go to the friend furthest behind (a friend
+///    added after the walk started catches up on the photos it had already
+///    passed), one to the shared walk back through the library. A turn with
+///    nothing to do goes to the other kind.
+/// 3. A few iCloud downloads, for photos whose original isn't on the phone and
+///    whose on-phone copy couldn't rule them out.
+///
+/// Every step saves its cursor, so a scan cut short — backgrounded, killed, a
+/// hold that outlasts the app — carries on where it stopped. It runs at utility
+/// priority while the app is open (including during a game), pauses within a
+/// photo while the foreground is snipping or identifying, gets about 30 s after
+/// the app is backgrounded, and longer overnight via a `BGProcessingTask`.
+/// Photos removed from an album by hand (`Friend.excludedIDs`) are never re-added.
 @Observable
 @MainActor
 final class FriendRescanner {
+    static let shared = FriendRescanner()
+
     enum Phase: Equatable {
         case idle
-        case local      // new photos on this device
-        case backfill   // older photos on this device, walking back through the library
-        case cloud      // photos that only exist in iCloud
+        case newPhotos
+        case catchingUp(String)   // a friend's name
+        case walking
+        case cloud
         case done
     }
 
     /// UserDefaults key behind the home screen's "auto-add new pics" switch.
     static let enabledKey = "autoScanNewPhotos"
+    /// Also listed under `BGTaskSchedulerPermittedIdentifiers` in Info.plist.
+    static let backgroundTaskID = "com.angryFriend.scan"
 
     private static let logger = Logger(subsystem: "com.angryFriend", category: "Rescan")
-    private static let localChunkSize = 24
-    private static let cloudChunkSize = 12
-    /// A catch-up pass re-checks every friend; don't do it more often than this.
-    private static let catchUpInterval: TimeInterval = 5 * 60
+    private static let chunkSize = 24
+    private static let cloudBatchSize = 24
+    private static let maxCloudAttempts = 3
 
     private(set) var phase: Phase = .idle
-    private(set) var friendID: UUID? = nil
+    private(set) var holdCount = 0
+    // For the home screen's status line; refreshed every round.
+    private(set) var walkRemaining = 0
+    private(set) var catchUpRemaining = 0
+    private(set) var cloudWaiting = 0
+    private(set) var isOffline = false
 
-    private var task: Task<Void, Never>? = nil
-    // Bumped on every start/cancel so a superseded scan can't touch state.
-    private var generation = 0
-    private var activeFriend: Friend? = nil
-    private var activeContext: ModelContext? = nil
-    /// Friends still waiting their turn in a catch-up pass.
-    private var queue: [Friend] = []
-    private var lastCatchUp: Date? = nil
-    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    /// Set while the processing screen waits for this friend's album to fill:
+    /// every catch-up turn goes to them, and the scan runs at user-initiated
+    /// priority until it's cleared.
+    var focusFriendID: UUID? = nil
+
+    @ObservationIgnored private var task: Task<Void, Never>? = nil
+    @ObservationIgnored private var control = ScanControl()
+    @ObservationIgnored private var generation = 0
+    @ObservationIgnored private var runPriority: TaskPriority = .utility
+    @ObservationIgnored private var restartForPriority = false
+    @ObservationIgnored private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    @ObservationIgnored private var backgroundRun: BGTask? = nil
+    @ObservationIgnored private var libraryObserver: LibraryObserver? = nil
+    @ObservationIgnored private var libraryChangeDebounce: Task<Void, Never>? = nil
+    @ObservationIgnored private var checkedThisRun = 0
+    /// Friends whose identity couldn't be rebuilt — skipped until next launch.
+    @ObservationIgnored private var unusableFriendIDs: Set<UUID> = []
+
+    private var context: ModelContext { angryFriendApp.container.mainContext }
+    private var library: PhotoLibraryService { PhotoLibraryService.shared }
 
     static var isEnabled: Bool {
         UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
@@ -59,88 +122,436 @@ final class FriendRescanner {
         isEnabled && PhotoLibraryService.shared.authorizationStatus() == .authorized
     }
 
-    var isRunning: Bool { phase == .local || phase == .backfill || phase == .cloud }
+    var isRunning: Bool { task != nil && !control.isStopped }
 
-    func isScanning(for friend: Friend) -> Bool {
-        friendID == friend.id && isRunning
+    /// While a scan is going there's still a chance of more photos turning up
+    /// for `friend`; once it ends, the library has nothing more to give.
+    func couldStillAdd(to friend: Friend) -> Bool {
+        isRunning && !unusableFriendIDs.contains(friend.id)
     }
 
-    /// Starts a scan for `friend`, replacing any scan already running. Does
-    /// nothing when the switch is off or the app can't see the whole library.
-    func start(for friend: Friend, context: ModelContext) {
-        cancel()
+    // MARK: - Control
+
+    /// Starts the scan unless it's already going. Cheap — call it whenever
+    /// there might be something new: launch, foreground, tapping a friend, a
+    /// change in the library.
+    func ensureRunning() {
+        if UIApplication.shared.applicationState == .active { endBackgroundTask() }
         guard Self.canScan else { return }
-        begin(friend, context: context)
+        observeLibrary()
+        guard !isRunning else { return }
+        start()
     }
 
-    /// Picks up where any earlier scan left off, for every friend with work
-    /// outstanding: unseen photos since their cursor, or iCloud photos still
-    /// queued. Runs one friend at a time; a play-triggered scan takes over.
-    func catchUp(friends: [Friend], context: ModelContext, ignoringThrottle: Bool = false) {
-        guard !isRunning, Self.canScan, !friends.isEmpty else { return }
-        if !ignoringThrottle, let last = lastCatchUp,
-           Date().timeIntervalSince(last) < Self.catchUpInterval { return }
-        lastCatchUp = Date()
-
-        queue = friends.filter { friend in
-            !friend.backfillDone
-                || !friend.pendingCloudIDs.isEmpty
-                || !PhotoLibraryService.shared.fetchAssets(since: friend.lastScannedAt ?? friend.createdAt).isEmpty
-        }
-        guard !queue.isEmpty else { return }
-        Self.logger.info("Catch-up: \(self.queue.count) friend(s) have new photos to check")
-        activeContext = context
-        startNext()
-    }
-
-    func cancel() {
-        task?.cancel()
-        task = nil
+    /// The switch was turned off.
+    func stop() {
+        control.stop()
         generation += 1
+        task = nil
         phase = .idle
-        friendID = nil
-        activeFriend = nil
-        activeContext = nil
-        queue = []
         endBackgroundTask()
+        finishBackgroundRun(success: true)
     }
 
-    // MARK: - Lifecycle
+    /// The foreground needs the phone (cutting out cards, identifying a new
+    /// friend): no new photo is started until every hold is released.
+    func beginHold() {
+        holdCount += 1
+        control.setHeld(true)
+        if holdCount == 1 { Self.logger.info("Scan paused for the foreground") }
+    }
 
-    private func begin(_ friend: Friend, context: ModelContext) {
-        friendID = friend.id
-        activeFriend = friend
-        activeContext = context
-        phase = .local
-        beginBackgroundTask()
+    func endHold() {
+        holdCount = max(0, holdCount - 1)
+        control.setHeld(holdCount > 0)
+        if holdCount == 0 { Self.logger.info("Scan resumed") }
+    }
+
+    private func start() {
+        generation += 1
         let gen = generation
-        task = Task { await run(generation: gen) }
+        let control = ScanControl()
+        control.setHeld(holdCount > 0)
+        self.control = control
+        runPriority = focusFriendID == nil ? .utility : .userInitiated
+        restartForPriority = false
+        checkedThisRun = 0
+        if backgroundRun == nil, UIApplication.shared.applicationState == .background { beginBackgroundTask() }
+        task = Task(priority: runPriority) { await self.run(generation: gen, control: control) }
     }
 
-    private func startNext() {
-        guard let context = activeContext, !queue.isEmpty else { return }
-        let friend = queue.removeFirst()
-        guard !friend.isDeleted else { startNext(); return }
-        begin(friend, context: context)
-    }
-
-    private func finish(generation gen: Int) {
-        guard gen == generation else { return }
-        phase = .done
+    private func finished(generation gen: Int, control: ScanControl) {
+        guard gen == generation else { return }   // superseded by stop() or a newer start()
+        task = nil
+        if restartForPriority, !control.isStopped {
+            start()
+            return
+        }
+        if control.isStopped { phase = .idle }
+        Self.logger.info("Scan ended: \(self.checkedThisRun) photos checked\(control.isStopped ? " (stopped)" : "")")
         endBackgroundTask()
-        startNext()
+        finishBackgroundRun(success: !control.isStopped)
     }
 
-    /// Asks iOS for extra time when the app is sent to the background mid-scan —
-    /// usually enough to finish the current chunk and write the cursor. When it
-    /// runs out the scan is cancelled; whatever was saved is picked up next time.
+    private func isCurrent(_ gen: Int, _ control: ScanControl) -> Bool {
+        gen == generation && !control.isStopped && !Task.isCancelled
+    }
+
+    // MARK: - The loop
+
+    private enum StepResult { case worked, nothingLeft, stopped }
+
+    /// Who's being scanned for this round, and what each already has.
+    private struct Round {
+        var friends: [UUID: Friend]
+        var identities: [UUID: [FaceEmbedding]]
+        var known: [UUID: Set<String>]   // photoMatches ∪ excludedIDs — never checked again
+    }
+
+    private func run(generation gen: Int, control: ScanControl) async {
+        defer { finished(generation: gen, control: control) }
+
+        let state = ScanState.load(in: context)
+        guard hasWork(state) else {
+            refreshCounts(state)
+            phase = .done
+            return
+        }
+        // Loading the model blocks, so keep it off the main thread.
+        guard let service = await Task.detached(priority: .utility, operation: { try? FaceMatchingService() }).value,
+              isCurrent(gen, control) else { return }
+
+        Self.logger.info("Scan started (\(self.runPriority == .userInitiated ? "focused" : "background")): new photos after \(state.newestModifiedSeen), walk \(state.walkDone ? "done" : "at \(state.walkCursor)"), \(state.pendingCloudIDs.count) waiting for iCloud")
+
+        while isCurrent(gen, control) {
+            let wanted: TaskPriority = focusFriendID == nil ? .utility : .userInitiated
+            if wanted != runPriority {
+                restartForPriority = true
+                return
+            }
+
+            guard let round = await prepareRound(state, service: service, generation: gen, control: control) else {
+                phase = .done
+                return
+            }
+            var worked = false
+
+            // 1. New photos first: a fresh shot should show up fast.
+            switch await forwardStep(round, state: state, service: service, generation: gen, control: control) {
+            case .stopped: return
+            case .worked: worked = true
+            case .nothingLeft: break
+            }
+
+            // 2. Two turns for whoever is furthest behind, one for the shared walk.
+            // Picked once per round: counting what each friend has left is a
+            // library query, and this runs on the main actor.
+            let lagging = laggingFriend(round)
+            let focused = lagging != nil && lagging?.id == focusFriendID
+            for turn in 0..<3 {
+                guard isCurrent(gen, control) else { return }
+                let catchUpTurn = focused || turn < 2
+                var result = StepResult.nothingLeft
+                if catchUpTurn, let friend = lagging {
+                    result = await catchUpStep(friend, round: round, state: state, service: service, generation: gen, control: control)
+                }
+                if result == .nothingLeft {
+                    result = await walkStep(round, state: state, service: service, generation: gen, control: control)
+                }
+                if result == .nothingLeft, !catchUpTurn, let friend = lagging {
+                    result = await catchUpStep(friend, round: round, state: state, service: service, generation: gen, control: control)
+                }
+                if result == .stopped { return }
+                if result == .worked { worked = true }
+            }
+
+            // 3. A few iCloud downloads.
+            switch await cloudStep(round, state: state, service: service, generation: gen, control: control) {
+            case .stopped: return
+            case .worked: worked = true
+            case .nothingLeft: break
+            }
+
+            refreshCounts(state)
+            if !worked {
+                phase = .done
+                Self.logger.info("Scan up to date\(state.pendingCloudIDs.isEmpty ? "" : "; \(state.pendingCloudIDs.count) waiting for iCloud (offline)")")
+                return
+            }
+        }
+    }
+
+    /// Anything for the scan to do? Answered from cursors and counts alone, so
+    /// a library change that brought nothing new doesn't load the face model.
+    private func hasWork(_ state: ScanState) -> Bool {
+        let friends = (try? context.fetch(FetchDescriptor<Friend>())) ?? []
+        guard !friends.isEmpty else {
+            // Nobody to look for. Keep the new-photos cursor current, so the
+            // first friend's own catch-up covers the past rather than both.
+            state.newestModifiedSeen = max(state.newestModifiedSeen, Date())
+            save()
+            return false
+        }
+        return friends.contains { $0.catchUpFloor == nil || $0.needsCatchUp }
+            || !state.walkDone
+            || (!state.pendingCloudIDs.isEmpty && NetworkMonitor.shared.isOnline)
+            || library.count(changedAfter: state.newestModifiedSeen) > 0
+    }
+
+    private func prepareRound(_ state: ScanState, service: FaceMatchingService, generation gen: Int, control: ScanControl) async -> Round? {
+        let all = (try? context.fetch(FetchDescriptor<Friend>())) ?? []
+        guard !all.isEmpty else { return nil }
+
+        // Newcomers join the scan here. The shared walk covers everything older
+        // than where it is now; their own catch-up covers the rest, back from
+        // now to there. Photos added from here on reach them via new photos.
+        let now = Date()
+        for friend in all where friend.catchUpFloor == nil {
+            friend.catchUpFloor = state.walkDone ? .distantPast : state.walkCursor
+            friend.catchUpBefore = now
+            Self.logger.info("\(friend.name) joined the scan; catching up from now back to \(friend.catchUpFloor!)")
+        }
+        save()
+
+        // Friends saved before identities were stored: derive one from photos
+        // they're already known to be in, once.
+        for friend in all where friend.identity.isEmpty && !unusableFriendIDs.contains(friend.id) {
+            let sample = Array(friend.photoMatches.shuffled().prefix(8))
+            let assets = Self.assets(withIDs: sample.map(\.assetID))
+            let known = sample.compactMap { match in
+                assets[match.assetID].map { (asset: $0, box: match.faceBoundingBox) }
+            }
+            let identity = await service.embedKnownFaces(known)
+            guard isCurrent(gen, control) else { return nil }
+            guard Self.isAlive(friend), !identity.isEmpty else {
+                unusableFriendIDs.insert(friend.id)
+                Self.logger.warning("Couldn't rebuild a face for \(friend.name); skipping them")
+                continue
+            }
+            friend.identity = identity
+            save()
+        }
+
+        var round = Round(friends: [:], identities: [:], known: [:])
+        for friend in all where Self.isAlive(friend) && !unusableFriendIDs.contains(friend.id) {
+            let identity = friend.identity
+            guard !identity.isEmpty else { continue }
+            round.friends[friend.id] = friend
+            round.identities[friend.id] = identity
+            round.known[friend.id] = Set(friend.photoMatches.map(\.assetID) + friend.excludedIDs)
+        }
+        return round.friends.isEmpty ? nil : round
+    }
+
+    /// The friend with the most photos still to catch up on — the focus friend
+    /// first, if they have any.
+    private func laggingFriend(_ round: Round) -> Friend? {
+        let behind = round.friends.values.filter { Self.isAlive($0) && $0.needsCatchUp }
+        if let focusFriendID, let focus = behind.first(where: { $0.id == focusFriendID }) { return focus }
+        return behind.max { remaining($0) < remaining($1) }
+    }
+
+    private func remaining(_ friend: Friend) -> Int {
+        guard let before = friend.catchUpBefore, let floor = friend.catchUpFloor else { return 0 }
+        return library.count(before: before, floor: floor)
+    }
+
+    // MARK: Steps
+
+    /// Photos added or edited since last time, checked against everyone.
+    private func forwardStep(_ round: Round, state: ScanState, service: FaceMatchingService, generation gen: Int, control: ScanControl) async -> StepResult {
+        let step = library.stepForward(after: state.newestModifiedSeen, limit: Self.chunkSize)
+        guard let next = step.next else { return .nothingLeft }
+        Self.logger.debug("New photos: \(step.assets.count) changed after \(state.newestModifiedSeen)")
+        phase = .newPhotos
+        guard await check(step.assets, for: Array(round.friends.keys), round: round, state: state,
+                          service: service, generation: gen, control: control) else { return .stopped }
+        state.newestModifiedSeen = max(state.newestModifiedSeen, next)
+        save()
+        return .worked
+    }
+
+    /// One chunk of a friend's own walk back through what the shared walk had
+    /// already passed when they joined.
+    private func catchUpStep(_ friend: Friend, round: Round, state: ScanState, service: FaceMatchingService, generation gen: Int, control: ScanControl) async -> StepResult {
+        guard let before = friend.catchUpBefore, let floor = friend.catchUpFloor, before > floor else { return .nothingLeft }
+        phase = .catchingUp(friend.name)
+        let step = library.stepBack(before: before, floor: floor == .distantPast ? nil : floor, limit: Self.chunkSize)
+        Self.logger.debug("Catch-up \(friend.name): \(step.assets.count) photos before \(before)")
+        guard let next = step.next else {
+            friend.catchUpBefore = floor
+            save()
+            Self.logger.info("\(friend.name) caught up; album has \(friend.photoMatches.count)")
+            return .worked
+        }
+        guard await check(step.assets, for: [friend.id], round: round, state: state,
+                          service: service, generation: gen, control: control) else { return .stopped }
+        guard Self.isAlive(friend) else { return .worked }
+        friend.catchUpBefore = max(next, floor)
+        save()
+        return .worked
+    }
+
+    /// One chunk of the shared walk back through the library, checked against everyone.
+    private func walkStep(_ round: Round, state: ScanState, service: FaceMatchingService, generation gen: Int, control: ScanControl) async -> StepResult {
+        guard !state.walkDone else { return .nothingLeft }
+        phase = .walking
+        let step = library.stepBack(before: state.walkCursor, limit: Self.chunkSize)
+        Self.logger.debug("Walk: \(step.assets.count) photos before \(state.walkCursor)")
+        guard let next = step.next else {
+            state.walkDone = true
+            save()
+            Self.logger.info("Walk reached the oldest photo")
+            return .worked
+        }
+        guard await check(step.assets, for: Array(round.friends.keys), round: round, state: state,
+                          service: service, generation: gen, control: control) else { return .stopped }
+        state.walkBefore = next
+        save()
+        return .worked
+    }
+
+    /// Downloads a few photos whose originals are only in iCloud and checks them
+    /// against everyone. A download that fails goes to the back of the queue;
+    /// after three failures the photo is dropped.
+    private func cloudStep(_ round: Round, state: ScanState, service: FaceMatchingService, generation gen: Int, control: ScanControl) async -> StepResult {
+        guard !state.pendingCloudIDs.isEmpty else { return .nothingLeft }
+        guard NetworkMonitor.shared.isOnline else {
+            isOffline = true
+            return .nothingLeft
+        }
+        isOffline = false
+        phase = .cloud
+
+        let batch = Array(state.pendingCloudIDs.prefix(Self.cloudBatchSize))
+        let assets = Self.assets(withIDs: batch)
+        let candidates: [ScanCandidate] = batch.compactMap { id in
+            guard let asset = assets[id] else { return nil }   // deleted since it was queued
+            let friendIDs = round.friends.keys.filter { !(round.known[$0]?.contains(id) ?? false) }
+            return friendIDs.isEmpty ? nil : ScanCandidate(asset: asset, friendIDs: friendIDs)
+        }
+
+        var result = FriendsSearchResult()
+        if !candidates.isEmpty {
+            result = await service.findFriends(identities: round.identities, in: candidates, mode: .download, control: control) { friendID, face in
+                Task { @MainActor in FriendRescanner.shared.add(face, to: friendID) }
+            }
+            guard gen == generation else { return .stopped }
+            for (friendID, faces) in result.found {
+                faces.forEach { add($0, to: friendID) }
+            }
+            checkedThisRun += result.checkedIDs.count
+        }
+
+        // Not reached because the scan stopped: stay at the front.
+        let attempted = Set(candidates.map(\.asset.localIdentifier))
+        let failed = Set(result.failedIDs)
+        let unreached = batch.filter { attempted.contains($0) && !result.checkedIDs.contains($0) && !failed.contains($0) }
+        var retries = state.cloudRetries
+        var retryLater: [String] = []
+        for id in batch {
+            if failed.contains(id) {
+                let attempts = retries[id, default: 0] + 1
+                if attempts >= Self.maxCloudAttempts {
+                    retries[id] = nil
+                    Self.logger.warning("Giving up on iCloud photo \(id.prefix(8)) after \(attempts) failed downloads")
+                } else {
+                    retries[id] = attempts
+                    retryLater.append(id)
+                }
+            } else if !unreached.contains(id) {
+                retries[id] = nil
+            }
+        }
+        state.pendingCloudIDs = unreached + state.pendingCloudIDs.dropFirst(batch.count) + retryLater
+        state.cloudRetries = retries
+        save()
+        return isCurrent(gen, control) ? .worked : .stopped
+    }
+
+    /// Checks photos on the phone for `friendIDs`, skipping friends who already
+    /// have (or have excluded) a photo and photos already waiting for iCloud.
+    /// False if the scan stopped part-way — the caller then leaves its cursor
+    /// where it was, so the chunk is done again next time.
+    private func check(_ assets: [PHAsset], for friendIDs: [UUID], round: Round, state: ScanState, service: FaceMatchingService, generation gen: Int, control: ScanControl) async -> Bool {
+        let waiting = Set(state.pendingCloudIDs)
+        let candidates: [ScanCandidate] = assets.compactMap { asset in
+            let id = asset.localIdentifier
+            guard !waiting.contains(id) else { return nil }
+            let unchecked = friendIDs.filter { !(round.known[$0]?.contains(id) ?? false) }
+            return unchecked.isEmpty ? nil : ScanCandidate(asset: asset, friendIDs: unchecked)
+        }
+        guard !candidates.isEmpty else { return true }
+
+        // Matches land as they're found, so an album being waited on fills live.
+        let result = await service.findFriends(identities: round.identities, in: candidates, mode: .local, control: control) { friendID, face in
+            Task { @MainActor in FriendRescanner.shared.add(face, to: friendID) }
+        }
+        guard isCurrent(gen, control) else { return false }
+        for (friendID, faces) in result.found {
+            faces.forEach { add($0, to: friendID) }
+        }
+        checkedThisRun += result.checkedIDs.count + result.cloudIDs.count
+        guard result.completed else { return false }
+
+        let queued = Set(state.pendingCloudIDs)
+        state.pendingCloudIDs += (result.cloudIDs + result.failedIDs).filter { !queued.contains($0) }
+        return true
+    }
+
+    private func add(_ face: FoundFace, to friendID: UUID) {
+        let descriptor = FetchDescriptor<Friend>(predicate: #Predicate { $0.id == friendID })
+        guard let friend = try? context.fetch(descriptor).first, Self.isAlive(friend),
+              !friend.excludedIDs.contains(face.assetID),
+              !friend.photoMatches.contains(where: { $0.assetID == face.assetID }) else { return }
+        friend.photoMatches.append(PhotoMatch(assetID: face.assetID, faceBoundingBox: face.faceBoundingBox))
+        save()
+        Self.logger.info("Added a photo to \(friend.name); album now \(friend.photoMatches.count)")
+    }
+
+    private func refreshCounts(_ state: ScanState) {
+        walkRemaining = state.walkDone ? 0 : library.count(before: state.walkCursor)
+        let friends = (try? context.fetch(FetchDescriptor<Friend>())) ?? []
+        if case .catchingUp(let name) = phase, let friend = friends.first(where: { $0.name == name && $0.needsCatchUp }) {
+            catchUpRemaining = remaining(friend)
+        } else {
+            catchUpRemaining = friends.filter(\.needsCatchUp).reduce(0) { $0 + remaining($1) }
+        }
+        cloudWaiting = state.pendingCloudIDs.count
+    }
+
+    /// One line for the home screen, or nil when there's nothing to say.
+    var statusLine: String? {
+        guard Self.isEnabled else { return nil }
+        var parts: [String] = []
+        if isRunning, holdCount > 0 {
+            parts.append("paused while snipping")
+        } else {
+            switch phase {
+            case .idle: return nil
+            case .newPhotos: parts.append("checking new photos")
+            case .catchingUp(let name): parts.append("catching up \(name) · \(catchUpRemaining.formatted()) left")
+            case .walking: parts.append("checking older photos · \(walkRemaining.formatted()) left")
+            case .cloud: parts.append("downloading from iCloud")
+            case .done: parts.append(cloudWaiting > 0 && isOffline ? "offline" : "up to date")
+            }
+        }
+        if cloudWaiting > 0 { parts.append("\(cloudWaiting.formatted()) waiting for iCloud") }
+        return parts.joined(separator: " · ")
+    }
+
+    // MARK: - App lifecycle
+
+    /// Extra time once the app is in the background — usually enough to finish
+    /// the chunk in hand. When it runs out the scan stops; every cursor is
+    /// already saved.
     private func beginBackgroundTask() {
         endBackgroundTask()
-        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "friend-rescan") { [weak self] in
-            Task { @MainActor in
-                Self.logger.info("Background time expired; scan will resume next launch")
-                self?.cancel()
-            }
+        let control = self.control
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "friend-scan") { [weak self] in
+            Self.logger.info("Background time expired; scan will resume later")
+            control.stop()
+            self?.endBackgroundTask()
         }
     }
 
@@ -150,171 +561,90 @@ final class FriendRescanner {
         backgroundTask = .invalid
     }
 
-    // MARK: - Scan
-
-    private func run(generation gen: Int) async {
-        defer { finish(generation: gen) }
-        guard let friend = activeFriend else { return }
-
-        // Loading the model blocks, so keep it off the main thread.
-        guard let service = await Task.detached(operation: { try? FaceMatchingService() }).value,
-              isCurrent(gen) else { return }
-
-        var identity = friend.identity
-        if identity.isEmpty {
-            let sample = Array(friend.photoMatches.shuffled().prefix(8))
-            let assets = Self.assets(withIDs: sample.map(\.assetID))
-            let known = sample.compactMap { match in
-                assets[match.assetID].map { (asset: $0, box: match.faceBoundingBox) }
+    /// Called from `didFinishLaunching` — iOS requires the handler registered
+    /// before launch completes.
+    static func registerBackgroundTask() {
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: backgroundTaskID, using: .main) { task in
+            MainActor.assumeIsolated {
+                FriendRescanner.shared.runBackgroundTask(task)
             }
-            identity = await service.embedKnownFaces(known)
-            guard isCurrent(gen), !identity.isEmpty else { return }
-            friend.identity = identity
-            save()
         }
-
-        // Newest photos first so a fresh shot shows up fast, then whatever iCloud
-        // photos that queued, then the slow walk back through the older library
-        // (and the iCloud photos it queues). Every pass saves as it goes.
-        guard await newPhotosPass(friend, identity: identity, service: service, generation: gen) else { return }
-        guard await cloudPass(friend, identity: identity, service: service, generation: gen) else { return }
-        guard await backfillPass(friend, identity: identity, service: service, generation: gen) else { return }
-        _ = await cloudPass(friend, identity: identity, service: service, generation: gen)
     }
 
-    /// Photos on this device taken (or saved) since the cursor. Oldest first, in
-    /// chunks; the cursor moves up after each one, so an interrupted pass resumes
-    /// at the chunk it was on rather than re-checking everything.
-    private func newPhotosPass(_ friend: Friend, identity: [FaceEmbedding], service: FaceMatchingService, generation gen: Int) async -> Bool {
-        phase = .local
-        let scanStart = Date()
-        let skip = Set(friend.photoMatches.map(\.assetID) + friend.pendingCloudIDs + friend.excludedIDs)
-        let fresh = Array(PhotoLibraryService.shared
-            .fetchAssets(since: friend.lastScannedAt ?? friend.createdAt)
-            .filter { !skip.contains($0.localIdentifier) }
-            .reversed())
-
-        if !fresh.isEmpty {
-            Self.logger.info("New photos: \(fresh.count) to check")
-        }
-        var index = 0
-        while index < fresh.count {
-            let chunk = Array(fresh[index..<min(index + Self.localChunkSize, fresh.count)])
-            index += chunk.count
-            let local = await service.findFriend(identity: identity, in: chunk, allowNetwork: false) { face in
-                Task { @MainActor in self.add([face], generation: gen) }
-            }
-            guard isCurrent(gen) else { return false }
-            add(local.found, generation: gen)
-            guard local.completed else { return false }
-            friend.pendingCloudIDs.append(contentsOf: local.unloadedIDs)
-            // A second back from the newest photo checked, so a burst of shots
-            // sharing that second isn't skipped on resume (known IDs dedupe).
-            // Never moves backwards: imported photos with old shot dates sort
-            // first and must not drag the cursor into the past.
-            if let newest = chunk.last?.creationDate {
-                let cursor = newest.addingTimeInterval(-1)
-                friend.lastScannedAt = max(friend.lastScannedAt ?? friend.createdAt, cursor)
-            }
-            save()
-        }
-        friend.lastScannedAt = scanStart
-        save()
-        return true
+    /// The app was sent to the background: ask for the usual ~30 s to finish
+    /// the chunk in hand, and for a long run later.
+    func appDidEnterBackground() {
+        if isRunning, backgroundRun == nil { beginBackgroundTask() }
+        scheduleBackgroundRun()
     }
 
-    /// Everything taken before the friend was created, newest first, one chunk
-    /// at a time with the cursor saved after each — a big library takes many
-    /// sittings, and each one carries on from the last. Ends when the walk
-    /// reaches the oldest photo.
-    private func backfillPass(_ friend: Friend, identity: [FaceEmbedding], service: FaceMatchingService, generation gen: Int) async -> Bool {
-        guard !friend.backfillDone else { return true }
-        phase = .backfill
-        if friend.backfillBefore == nil {
-            Self.logger.info("Backfill: starting the walk back through older photos")
+    /// Asks iOS for a long run later, typically overnight while charging. The
+    /// run also picks up the day's new photos, so it's asked for whenever the
+    /// switch is on.
+    private func scheduleBackgroundRun() {
+        guard Self.canScan else { return }
+        let request = BGProcessingTaskRequest(identifier: Self.backgroundTaskID)
+        request.requiresExternalPower = true
+        request.requiresNetworkConnectivity = false
+        do {
+            try BGTaskScheduler.shared.submit(request)
+            Self.logger.info("Background run requested")
+        } catch {
+            Self.logger.warning("Couldn't request a background run: \(error.localizedDescription)")
         }
-        while !friend.backfillDone {
-            let cursor = friend.backfillBefore ?? friend.createdAt
-            let chunk = PhotoLibraryService.shared.fetchAssets(before: cursor, limit: Self.localChunkSize)
-            guard let oldest = chunk.last?.creationDate else {
-                friend.backfillDone = true
-                save()
-                Self.logger.info("Backfill: reached the oldest photo; album has \(friend.photoMatches.count)")
-                return true
-            }
+    }
 
-            let skip = Set(friend.photoMatches.map(\.assetID) + friend.pendingCloudIDs + friend.excludedIDs)
-            let toCheck = chunk.filter { !skip.contains($0.localIdentifier) }
-            if !toCheck.isEmpty {
-                let result = await service.findFriend(identity: identity, in: toCheck, allowNetwork: false) { face in
-                    Task { @MainActor in self.add([face], generation: gen) }
-                }
-                guard isCurrent(gen) else { return false }
-                add(result.found, generation: gen)
-                guard result.completed else { return false }
-                friend.pendingCloudIDs.append(contentsOf: result.unloadedIDs)
-            }
-            // Photos sharing the oldest second are re-fetched next chunk; known
-            // IDs dedupe them, and the walk still moves because `<` is strict
-            // once the cursor passes them.
-            friend.backfillBefore = oldest.addingTimeInterval(1)
-            if friend.backfillBefore == cursor {
-                // Degenerate: a whole chunk of photos sharing one second.
-                friend.backfillBefore = oldest
-            }
-            save()
+    private func runBackgroundTask(_ bgTask: BGTask) {
+        Self.logger.info("Background run started")
+        guard Self.canScan else {
+            bgTask.setTaskCompleted(success: true)
+            return
         }
-        return true
-    }
-
-    /// Photos with no local copy. Done in small chunks, each one recorded as it
-    /// finishes, so quitting mid-way doesn't redo downloads.
-    private func cloudPass(_ friend: Friend, identity: [FaceEmbedding], service: FaceMatchingService, generation gen: Int) async -> Bool {
-        let pendingAssets = Self.assets(withIDs: friend.pendingCloudIDs)
-        let skip = Set(friend.photoMatches.map(\.assetID) + friend.excludedIDs)
-        let cloud = friend.pendingCloudIDs.compactMap { pendingAssets[$0] }
-            .filter { !skip.contains($0.localIdentifier) }
-        // Photos deleted from the library since they were queued drop out here.
-        friend.pendingCloudIDs = cloud.map(\.localIdentifier)
-        save()
-        guard !cloud.isEmpty else { return true }
-
-        Self.logger.info("Cloud pass: \(cloud.count) photo(s) to download and check")
-        phase = .cloud
-        var index = 0
-        while index < cloud.count {
-            let chunk = Array(cloud[index..<min(index + Self.cloudChunkSize, cloud.count)])
-            index += chunk.count
-            let result = await service.findFriend(identity: identity, in: chunk, allowNetwork: true) { face in
-                Task { @MainActor in self.add([face], generation: gen) }
-            }
-            guard isCurrent(gen) else { return false }
-            add(result.found, generation: gen)
-            // Anything that still wouldn't load (offline, timed out) stays queued.
-            friend.pendingCloudIDs.removeAll { result.resolvedIDs.contains($0) }
-            save()
+        backgroundRun = bgTask
+        if !isRunning { start() }
+        let control = self.control
+        bgTask.expirationHandler = {
+            control.stop()
+            Task { @MainActor in FriendRescanner.shared.finishBackgroundRun(success: false) }
         }
-        return true
     }
 
-    private func isCurrent(_ gen: Int) -> Bool {
-        gen == generation && !Task.isCancelled && activeFriend?.isDeleted == false
+    private func finishBackgroundRun(success: Bool) {
+        guard let run = backgroundRun else { return }
+        backgroundRun = nil
+        Self.logger.info("Background run finished (\(success ? "done" : "out of time")): \(self.checkedThisRun) photos checked")
+        run.setTaskCompleted(success: success)
+        scheduleBackgroundRun()
     }
 
-    private func add(_ faces: [FoundFace], generation gen: Int) {
-        guard gen == generation, let friend = activeFriend, !friend.isDeleted else { return }
-        var known = Set(friend.photoMatches.map(\.assetID) + friend.excludedIDs)
-        let new = faces.filter { known.insert($0.assetID).inserted }
-        guard !new.isEmpty else { return }
-        friend.photoMatches.append(contentsOf: new.map {
-            PhotoMatch(assetID: $0.assetID, faceBoundingBox: $0.faceBoundingBox)
-        })
-        save()
-        Self.logger.info("Rescan added \(new.count) photo(s); album now \(friend.photoMatches.count)")
+    /// Restarts the scan a few seconds after the library changes — a photo
+    /// taken, saved or synced while the app is open.
+    private func observeLibrary() {
+        guard libraryObserver == nil else { return }
+        let observer = LibraryObserver {
+            Task { @MainActor in FriendRescanner.shared.libraryDidChange() }
+        }
+        PHPhotoLibrary.shared().register(observer)
+        libraryObserver = observer
     }
+
+    private func libraryDidChange() {
+        libraryChangeDebounce?.cancel()
+        libraryChangeDebounce = Task {
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, UIApplication.shared.applicationState == .active else { return }
+            ensureRunning()
+        }
+    }
+
+    // MARK: - Helpers
 
     private func save() {
-        try? activeContext?.save()
+        try? context.save()
+    }
+
+    private static func isAlive(_ friend: Friend) -> Bool {
+        !friend.isDeleted && friend.modelContext != nil
     }
 
     private static func assets(withIDs ids: [String]) -> [String: PHAsset] {
@@ -323,5 +653,17 @@ final class FriendRescanner {
             byID[asset.localIdentifier] = asset
         }
         return byID
+    }
+}
+
+private final class LibraryObserver: NSObject, PHPhotoLibraryChangeObserver {
+    private let onChange: @Sendable () -> Void
+
+    init(onChange: @escaping @Sendable () -> Void) {
+        self.onChange = onChange
+    }
+
+    nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
+        onChange()
     }
 }

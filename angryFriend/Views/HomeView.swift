@@ -71,7 +71,7 @@ struct HomeView: View {
             Haptics.warmUp()
             // Covers saved as JPEG lost their transparency; re-cut them once.
             Task { await CoverSticker.repairFlattenedCovers(savedFriends, context: modelContext) }
-            appState.rescanner.catchUp(friends: savedFriends, context: modelContext)
+            appState.rescanner.ensureRunning()
             if appState.pendingAddFriend {
                 // Sent here from the demo result to add a real friend: let the
                 // screen land first, then carry on into the add flow.
@@ -90,9 +90,6 @@ struct HomeView: View {
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
                 photoAccess = PhotoLibraryService.shared.authorizationStatus()
-                // Back from the background: finish any scan that was cut short
-                // and look for photos taken in the meantime.
-                appState.rescanner.catchUp(friends: savedFriends, context: modelContext)
             }
         }
         .alert("Allow All Photos", isPresented: $showAccessAlert) {
@@ -239,6 +236,21 @@ struct HomeView: View {
     }
 
     private var autoScanToggle: some View {
+        VStack(spacing: 8) {
+            autoScanSwitch
+            if autoScanIsOn, let status = appState.rescanner.statusLine {
+                Text(status)
+                    .font(.sticker(10, .medium))
+                    .foregroundStyle(StickerTheme.ink.opacity(0.6))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 30)
+                    .contentTransition(.numericText())
+                    .animation(.easeOut(duration: 0.2), value: status)
+            }
+        }
+    }
+
+    private var autoScanSwitch: some View {
         HStack(spacing: 8) {
             Text("AUTO-ADD NEW PICS")
                 .font(.sticker(10.5, .black))
@@ -312,18 +324,18 @@ struct HomeView: View {
         Haptics.flick()
         if autoScanIsOn {
             withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { autoScan = false }
-            appState.rescanner.cancel()
+            appState.rescanner.stop()
             return
         }
 
         withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { autoScan = true }
         switch photoAccess {
         case .authorized:
-            appState.rescanner.catchUp(friends: savedFriends, context: modelContext, ignoringThrottle: true)
+            appState.rescanner.ensureRunning()
         case .notDetermined:
             Task {
                 photoAccess = await PhotoLibraryService.shared.requestAuthorization()
-                appState.rescanner.catchUp(friends: savedFriends, context: modelContext, ignoringThrottle: true)
+                appState.rescanner.ensureRunning()
             }
         default:
             // iOS only shows its own prompt once — after that, widening access
@@ -339,7 +351,7 @@ struct HomeView: View {
     private func play(_ friend: Friend) {
         appState.currentFriend = friend
         appState.usedPhotoIDs = []
-        appState.rescanner.start(for: friend, context: modelContext)
+        appState.rescanner.ensureRunning()
         appState.screen = .processing
     }
 
