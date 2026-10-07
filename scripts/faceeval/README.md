@@ -25,6 +25,6 @@ python3 scripts/faceeval/analyze.py           # labels faces, prints/saves resul
 `analyze.py` sections: raw face-vs-face separability per model; the app protocol (friends
 created from 10 picked photos, everything else scanned) for today's rule vs mean template /
 exclusive assignment / margin / size gate, with a threshold sweep; mix-ups by face size;
-identity contamination at creation; template growth. Keys: `mbfcoreml` = shipped model,
-`r50`/`r100` = ResNet50/100 ArcFace; `_vis2pt` = the app's Vision 2-pt alignment,
+identity contamination at creation; template growth. Keys: `app` = the shipped CoreML model (ResNet50 since 2026-10-07),
+`mbf`/`r50`/`r100` = MobileFaceNet / ResNet50 / ResNet100 via ONNX; `_vis2pt` = the app's Vision 2-pt alignment,
 `_vis5a` = 5-pt from Vision landmarks, `_5pt` = reference SCRFD 5-pt.

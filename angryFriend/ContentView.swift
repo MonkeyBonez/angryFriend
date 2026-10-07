@@ -104,6 +104,10 @@ struct ContentView: View {
         #if DEBUG
         .task { await ScanTestSeed.runIfRequested(context: angryFriendApp.container.mainContext) }
         .task { await IdentityDiagnostic.runIfRequested(context: angryFriendApp.container.mainContext) }
+        .task {
+            DebugLaunch.applyKeepAwake()
+            await ModelComparison.runIfRequested(context: angryFriendApp.container.mainContext)
+        }
         #endif
         .onChange(of: scenePhase) { _, phase in
             switch phase {

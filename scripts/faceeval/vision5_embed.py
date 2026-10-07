@@ -11,7 +11,7 @@ MD = Path.home() / ".insightface" / "models"
 recs = {}
 for name, rel in [("mbf", "buffalo_sc/w600k_mbf.onnx"), ("r50", "buffalo_l/w600k_r50.onnx")]:
     m = get_model(str(MD / rel), providers=["CPUExecutionProvider"]); m.prepare(ctx_id=-1); recs[name] = m
-coreml = CoreMLModel(REPO / "angryFriend" / "MobileFaceNet.mlpackage")
+coreml = CoreMLModel(REPO / "angryFriend" / "FaceNetR50.mlpackage")  # the shipped model
 kept = json.loads((OUT / "vision_faces_kept.json").read_text())
 new_by_file = {}
 for l in (OUT / "vision_faces5.jsonl").read_text().splitlines():
@@ -31,7 +31,7 @@ def five(p, variant):
     return np.array(eyes + [nose] + mouth, np.float32)
 
 variants = ["a", "b"]
-embs = {f"{m}_vis5{v}": [] for m in list(recs) + ["mbfcoreml"] for v in variants}
+embs = {f"{m}_vis5{v}": [] for m in list(recs) + ["app"] for v in variants}
 have = {v: [] for v in variants}
 imgs = {}
 sheet = []
@@ -47,12 +47,12 @@ for k, f in enumerate(kept):
             except ValueError: chip = None
         have[v].append(chip is not None)
         if chip is None:
-            for m in list(recs) + ["mbfcoreml"]: embs[f"{m}_vis5{v}"].append(np.zeros(512, np.float32))
+            for m in list(recs) + ["app"]: embs[f"{m}_vis5{v}"].append(np.zeros(512, np.float32))
             continue
         if v == "a" and len(sheet) < 36: sheet.append(chip)
         for m, rec in recs.items():
             e = rec.get_feat(chip).flatten().astype(np.float32); embs[f"{m}_vis5{v}"].append(e / np.linalg.norm(e))
-        e = coreml.embed(chip); embs[f"mbfcoreml_vis5{v}"].append(e if e is not None else np.zeros(512, np.float32))
+        e = coreml.embed(chip); embs[f"app_vis5{v}"].append(e if e is not None else np.zeros(512, np.float32))
     if len(imgs) > 40: imgs.clear()
 np.savez_compressed(OUT / "vision5_embeddings.npz", **{k: np.stack(x) for k, x in embs.items()}, **{f"have_{v}": np.array(have[v]) for v in variants})
 rows = [np.hstack(sheet[i:i + 12]) for i in range(0, len(sheet) - len(sheet) % 12, 12)]

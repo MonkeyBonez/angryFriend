@@ -10,11 +10,17 @@ takes the penalty.
 Everything runs on device. There's no public API for the People album in Photos,
 so the app builds its own identity pipeline:
 
-1. **Detect & embed** — Vision finds faces; a MobileFaceNet Core ML model
-   (ArcFace, 512-dim) embeds each one.
-2. **Cluster** — greedy max-linkage clustering over cosine similarity picks the
-   identity appearing in the most distinct photos.
-3. **Cut out** — `VNGenerateForegroundInstanceMaskRequest` masks only that
+1. **Detect & embed** — Vision finds faces and their landmarks; each face is
+   aligned on five points and embedded by a ResNet50 ArcFace Core ML model
+   (insightface `w600k_r50`, 512-dim).
+2. **Group** — faces are grouped by person (each face joins the group whose
+   mean it's most like); the person in the most distinct photos is the friend,
+   stored as their 10 most typical faces.
+3. **Match** — the background scan gives each face to the one friend whose
+   mean face it's most like, only if it clears the bar and beats the runner-up
+   by a margin, so look-alike friends don't end up in each other's albums.
+   `scripts/faceeval/` measures all of this on local test photos.
+4. **Cut out** — `VNGenerateForegroundInstanceMaskRequest` masks only that
    person's instance, so nobody else ends up on a card.
 
 Friends are saved with SwiftData and can be replayed without re-running the

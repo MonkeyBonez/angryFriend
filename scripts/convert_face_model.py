@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Convert a MobileFaceNet ONNX model to CoreML (.mlpackage) for use in angryFriend.
+Convert an ArcFace-style ONNX face model (w600k_r50 ships today) to CoreML (.mlpackage) for use in angryFriend.
 
 Usage:
     pip3 install coremltools onnx onnx2pytorch
@@ -10,7 +10,7 @@ Or use the insightface buffalo_sc model (auto-downloads):
     pip3 install insightface onnxruntime coremltools onnx onnx2pytorch
     python3 scripts/convert_face_model.py --insightface
 
-Output: angryFriend/MobileFaceNet.mlpackage
+Output: angryFriend/FaceNetR50.mlpackage (pass --output for another name)
 Then drag it into Xcode and verify target membership.
 """
 
@@ -95,7 +95,7 @@ def main():
     # Determine project root (scripts/ is one level below project root)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)
-    default_output = os.path.join(project_root, "angryFriend", "MobileFaceNet.mlpackage")
+    default_output = os.path.join(project_root, "angryFriend", "FaceNetR50.mlpackage")
     output_path = args.output or default_output
 
     if args.insightface:
@@ -109,7 +109,7 @@ def main():
     convert_onnx(onnx_path, output_path)
     print(f"\nNext steps:")
     print(f"  1. Open angryFriend.xcodeproj in Xcode")
-    print(f"  2. Verify MobileFaceNet.mlpackage has target membership (check the project navigator)")
+    print(f"  2. Verify the .mlpackage has target membership (check the project navigator)")
     print(f"  3. Build and run")
 
 

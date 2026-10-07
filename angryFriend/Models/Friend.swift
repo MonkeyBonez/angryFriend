@@ -32,7 +32,8 @@ final class Friend {
     var createdAt: Date = Date()
     var stickerData: Data = Data()          // JPEG cover cutout — just this person, no one else
     var photoMatches: [PhotoMatch] = [PhotoMatch]()  // every photo this friend was found in — picked or found by rescan
-    var identityData: Data? = nil           // up to 3 face embeddings, flat [Float] bytes — what a rescan matches against
+    var identityData: Data? = nil           // up to 10 face embeddings, flat [Float] bytes — the template a rescan matches against is their mean
+    var identityVersion: Int = 0            // which matching rules built `identityData` and checked the album; below `currentIdentityVersion` → rebuilt and re-checked once
     var catchUpBefore: Date? = nil          // own walk back through photos the shared walk passed before this friend joined
     var catchUpFloor: Date? = nil           // ...down to here, where the shared walk was; nil → not joined the scan yet
     var excludedIDs: [String] = [String]()  // removed from the album on purpose — a rescan must never add them back
@@ -43,7 +44,14 @@ final class Friend {
         self.createdAt = Date()
         self.stickerData = stickerData
         self.photoMatches = photoMatches
+        self.identityVersion = Self.currentIdentityVersion
     }
+
+    /// Bumped whenever the matching rules or the face model change: stored
+    /// faces are rebuilt and albums re-checked once. 1 = mean template,
+    /// one-person-per-face assignment, 5-point alignment; 2 = ResNet50 model
+    /// (embeddings from different models can't be compared). Both 2026-10-07.
+    static let currentIdentityVersion = 2
 }
 
 extension Friend {
@@ -53,7 +61,10 @@ extension Friend {
         return catchUpBefore > catchUpFloor
     }
 
-    /// The friend's face, as stored in `identityData`. Empty for friends saved
+    /// Matching template: the mean of the stored faces. Nil until there are faces.
+    var template: FaceTemplate? { FaceTemplate(faces: identity) }
+
+    /// The friend's stored faces (`identityData`). Empty for friends saved
     /// before rescanning existed — the rescanner derives and stores it once.
     var identity: [FaceEmbedding] {
         get {

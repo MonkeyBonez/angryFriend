@@ -32,11 +32,11 @@ def main():
             m = get_model(str(p), providers=["CPUExecutionProvider"]); m.prepare(ctx_id=-1); recs[name] = m
         else:
             print("missing", p)
-    coreml = CoreMLModel(REPO / "angryFriend" / "MobileFaceNet.mlpackage")
+    coreml = CoreMLModel(REPO / "angryFriend" / "FaceNetR50.mlpackage")  # the shipped model
     aligns = {"2pt": align_2pt, "5pt": align_5pt}
     chips_dir = OUT / "chips"; chips_dir.mkdir(exist_ok=True)
 
-    meta, embs = [], {f"{m}_{a}": [] for m in list(recs) + ["mbfcoreml"] for a in aligns}
+    meta, embs = [], {f"{m}_{a}": [] for m in list(recs) + ["app"] for a in aligns}
     t0 = time.time(); n_img = 0
     for setname, person, folder in SETS:
         images = load_images(str(folder))
@@ -62,7 +62,7 @@ def main():
                 for a, chip in chips.items():
                     for m, rec in recs.items():
                         e = rec.get_feat(chip).flatten().astype(np.float32); embs[f"{m}_{a}"].append(e / np.linalg.norm(e))
-                    e = coreml.embed(chip); embs[f"mbfcoreml_{a}"].append(e if e is not None else np.zeros(512, np.float32))
+                    e = coreml.embed(chip); embs[f"app_{a}"].append(e if e is not None else np.zeros(512, np.float32))
             if n_img % 25 == 0:
                 print(f"  {n_img} images, {len(meta)} faces, {time.time() - t0:.0f}s", flush=True)
     np.savez_compressed(OUT / "embeddings.npz", **{k: np.stack(v) if v else np.zeros((0, 512), np.float32) for k, v in embs.items()})

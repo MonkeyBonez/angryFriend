@@ -158,21 +158,21 @@ P = report.append
 P(f"# Face-matching evaluation on the local test sets\n")
 P(f"{N} faces detected in {len(set(files))} photos. Labels (by {LABEL_KEY}): {counts}")
 P(f"Friends spotted in other people's folders: {len(cross)} faces (see sheet_crosslabel.jpg)\n")
-agree = (E["mbfcoreml_2pt"] * E["mbf_2pt"]).sum(1)
-P(f"CoreML vs ONNX MobileFaceNet agreement on the same chip: mean cos {agree.mean():.4f}, min {agree.min():.4f}\n")
+agree = (E["app_2pt"] * E["r50_2pt"]).sum(1)
+P(f"Shipped CoreML model vs ONNX ResNet50 on the same chip: mean cos {agree.mean():.4f}, min {agree.min():.4f}\n")
 
 P("## 1. Raw separability, face vs face (no templates)\n")
 if vis_mask.any():
     P(f"Vision found {vis_detected} faces vs SCRFD {N}; {vis_mask.sum()} SCRFD faces have a Vision match (IoU>0.4). "
       f"Labelled friend faces with a Vision match: {pct(vis_mask[np.isin(label, PEOPLE)].mean())}; "
       f"of friend faces ≥60px wide: {pct(vis_mask[np.isin(label, PEOPLE) & (face_w >= 60)].mean())}\n")
-keys1 = ["mbfcoreml_vis2pt", "mbfcoreml_vis5a", "mbfcoreml_vis5b", "mbfcoreml_2pt", "mbf_5pt", "r50_vis2pt", "r50_vis5a", "r50_vis5b", "r50_2pt", "r50_5pt", "r100_vis2pt", "r100_2pt", "r100_5pt"]
+keys1 = ["app_vis2pt", "app_vis5a", "app_vis5b", "app_2pt", "mbf_5pt", "r50_vis2pt", "r50_vis5a", "r50_vis5b", "r50_2pt", "r50_5pt", "r100_vis2pt", "r100_2pt", "r100_5pt"]
 for key in keys1:
     if key in E: P(f"### {key}\n{pairwise(key)}\n")
 
 P("## 2. App protocol (3 friends created from 10 picked photos each, then everything else scanned)\n")
 P("Counts are means over 40 random picks. 'mix-ups' = faces of one friend added to another friend's album.\n")
-for key in [k for k in ["mbfcoreml_vis2pt", "mbfcoreml_vis5a", "mbfcoreml_vis5b", "r50_vis2pt", "r50_vis5a", "r50_vis5b", "r50_5pt", "r100_5pt"] if k in E]:
+for key in [k for k in ["app_vis2pt", "app_vis5a", "app_vis5b", "r50_vis2pt", "r50_vis5a", "r50_vis5b", "r50_5pt", "r100_5pt"] if k in E]:
     P(f"### {key}")
     for strat in ["first3", "max", "mean"]:
         r = simulate(key, strat)[APP_THR]
@@ -191,8 +191,8 @@ for key in [k for k in ["mbfcoreml_vis2pt", "mbfcoreml_vis5a", "mbfcoreml_vis5b"
     P(f"  sweep (mean/exclusive/margin .05): " + "  ".join(f"{t}:{pct(sweep[t]['recall']).strip()}/{sweep[t]['confusion']:.0f}/{sweep[t]['fp']:.0f}" for t in thrs[::2]))
     P("")
 
-P("## 3. Where do the mix-ups come from? (today's pipeline: mbfcoreml_2pt, first3, non-exclusive)\n")
-V = E["mbfcoreml_vis2pt"] if vis_mask.any() else E["mbfcoreml_2pt"]
+P("## 3. Where do the mix-ups come from? (today's pipeline: app_2pt, first3, non-exclusive)\n")
+V = E["app_vis2pt"] if vis_mask.any() else E["app_2pt"]
 bins = [(0, 40), (40, 60), (60, 100), (100, 10000)]
 for lo, hi in bins:
     sel = (face_w >= lo) & (face_w < hi) & np.isin(label, PEOPLE)
@@ -235,7 +235,7 @@ def discovery_sim(key, K=10, trials=60, link="max"):
 
 report.append("\n## 4. Friend creation: does the identity get another person's face in it?\n")
 report.append("10 random photos from the friend's own folder (group shots included), app's clustering rule replayed 60×.\n")
-for key in [k for k in ["mbfcoreml_vis2pt", "mbfcoreml_2pt", "r50_vis2pt", "r50_5pt", "r100_5pt"] if k in E]:
+for key in [k for k in ["app_vis2pt", "app_2pt", "r50_vis2pt", "r50_5pt", "r100_5pt"] if k in E]:
     for link in ["max", "centroid"]:
         c, f3, ww = discovery_sim(key, link=link)
         report.append(f"  {key:16s} link={link:8s}: winner cluster contains someone else {pct(c)}; one of the 3 stored identity faces is someone else {pct(f3)}; winner is mostly the wrong person {pct(ww)}")
@@ -270,7 +270,7 @@ def growth_sim(key, K=10, trials=24, grow_thr=0.45, cap=24, margin=0.05, thr=APP
     return dict(recall=float(np.mean(recall)), confusion=confusion, fp=fp)
 
 report.append("\n## 5. Letting the identity grow from confident auto-adds (exclusive, margin 0.05, thr 0.27)\n")
-for key in [k for k in ["mbfcoreml_vis2pt", "r50_vis2pt", "r50_5pt", "r100_5pt"] if k in E]:
+for key in [k for k in ["app_vis2pt", "r50_vis2pt", "r50_5pt", "r100_5pt"] if k in E]:
     for mode, gt in [("static", 0), ("grow", 0.45), ("grow", 0.40)]:
         r = growth_sim(key, mode=mode, grow_thr=gt)
         report.append(f"  {key:16s} {mode:6s} grow≥{gt:.2f}: {fmt(r)}")

@@ -70,6 +70,7 @@ final class FriendRescanner {
         case idle
         case newPhotos
         case catchingUp(String)   // a friend's name
+        case tidying(String)      // re-checking a friend's album after the matching rules changed
         case walking
         case cloud
         case done
@@ -110,6 +111,12 @@ final class FriendRescanner {
     @ObservationIgnored private var checkedThisRun = 0
     /// Friends whose identity couldn't be rebuilt — skipped until next launch.
     @ObservationIgnored private var unusableFriendIDs: Set<UUID> = []
+    /// Album tidy verdicts already reached this launch (friend → photo → keep?),
+    /// so a tidy cut short by the background picks up where it was.
+    @ObservationIgnored private var tidyVerdicts: [UUID: [String: Bool]] = [:]
+    /// Friends whose faces the tidy already rebuilt this launch — kept as they
+    /// are on a resume, so the verdicts above stay consistent.
+    @ObservationIgnored private var rebuiltThisLaunch: Set<UUID> = []
 
     private var context: ModelContext { angryFriendApp.container.mainContext }
     private var library: PhotoLibraryService { PhotoLibraryService.shared }
@@ -119,7 +126,10 @@ final class FriendRescanner {
     }
 
     private static var canScan: Bool {
-        isEnabled && PhotoLibraryService.shared.authorizationStatus() == .authorized
+        #if DEBUG
+        if DebugLaunch.scanSuspended { return false }
+        #endif
+        return isEnabled && PhotoLibraryService.shared.authorizationStatus() == .authorized
     }
 
     var isRunning: Bool { task != nil && !control.isStopped }
@@ -204,7 +214,7 @@ final class FriendRescanner {
     /// Who's being scanned for this round, and what each already has.
     private struct Round {
         var friends: [UUID: Friend]
-        var identities: [UUID: [FaceEmbedding]]
+        var templates: [UUID: FaceTemplate]
         var known: [UUID: Set<String>]   // photoMatches ∪ excludedIDs — never checked again
     }
 
@@ -292,7 +302,7 @@ final class FriendRescanner {
             save()
             return false
         }
-        return friends.contains { $0.catchUpFloor == nil || $0.needsCatchUp }
+        return friends.contains { $0.catchUpFloor == nil || $0.needsCatchUp || $0.identityVersion < Friend.currentIdentityVersion }
             || !state.walkDone
             || (!state.pendingCloudIDs.isEmpty && NetworkMonitor.shared.isOnline)
             || library.count(changedAfter: state.newestModifiedSeen) > 0
@@ -313,34 +323,151 @@ final class FriendRescanner {
         }
         save()
 
-        // Friends saved before identities were stored: derive one from photos
-        // they're already known to be in, once.
-        for friend in all where friend.identity.isEmpty && !unusableFriendIDs.contains(friend.id) {
-            let sample = Array(friend.photoMatches.shuffled().prefix(8))
-            let assets = Self.assets(withIDs: sample.map(\.assetID))
-            let known = sample.compactMap { match in
-                assets[match.assetID].map { (asset: $0, box: match.faceBoundingBox) }
+        // Friends saved before identities were stored, or under older matching
+        // rules: rebuild their faces from the album and re-check it, once.
+        guard await tidyAlbums(all, state: state, service: service, generation: gen, control: control) else { return nil }
+
+        var round = Round(friends: [:], templates: [:], known: [:])
+        for friend in all where Self.isAlive(friend) && !unusableFriendIDs.contains(friend.id) {
+            guard let template = friend.template else { continue }
+            round.friends[friend.id] = friend
+            round.templates[friend.id] = template
+            round.known[friend.id] = Set(friend.photoMatches.map(\.assetID) + friend.excludedIDs)
+        }
+        return round.friends.isEmpty ? nil : round
+    }
+
+    /// Once after the matching rules or the face model change
+    /// (`Friend.currentIdentityVersion`):
+    /// 1. Rebuilds every such friend's stored faces from their album — the
+    ///    user's own picks come first in it — keeping the largest group's most
+    ///    central faces, so a stranger's face that slipped in is left out.
+    /// 2. Re-checks every photo in those albums against everyone's new faces
+    ///    and drops what no longer passes: a face that looks more like another
+    ///    friend, or like no one. Dropped photos aren't excluded; the scan may
+    ///    bring one back only if it passes the same rule.
+    /// 3. Walks the library again, since the old rules missed photos the new
+    ///    ones find.
+    /// All identities are rebuilt before any album is judged, so no album is
+    /// compared against faces from the old rules (or an old model, whose
+    /// embeddings mean nothing to the new one). False if the scan stopped
+    /// part-way; whatever wasn't finished is redone next time.
+    private func tidyAlbums(_ friends: [Friend], state: ScanState, service: FaceMatchingService, generation gen: Int, control: ScanControl) async -> Bool {
+        let stale = friends.filter {
+            Self.isAlive($0) && !unusableFriendIDs.contains($0.id)
+                && ($0.identityVersion < Friend.currentIdentityVersion || $0.identity.isEmpty)
+        }
+        guard !stale.isEmpty else { return true }
+        Self.logger.info("Matching rules changed: rebuilding faces for \(stale.map(\.name).joined(separator: ", "))")
+
+        // 1. Faces, for every stale friend first. A friend whose new faces are
+        //    already stored (a tidy cut short in step 2) keeps them.
+        var rebuilt: Set<UUID> = []
+        for friend in stale {
+            if rebuiltThisLaunch.contains(friend.id), !friend.identity.isEmpty {
+                rebuilt.insert(friend.id)
+                continue
             }
-            let identity = await service.embedKnownFaces(known)
-            guard isCurrent(gen, control) else { return nil }
+            phase = .tidying(friend.name)
+            let sample = Array(friend.photoMatches.prefix(24))
+            let sampleAssets = Self.assets(withIDs: sample.map(\.assetID))
+            let known = sample.compactMap { match in
+                sampleAssets[match.assetID].map { (asset: $0, box: match.faceBoundingBox) }
+            }
+            let faces = await service.embedKnownFaces(known, limit: sample.count)
+            guard isCurrent(gen, control) else { return false }
+            let identity = FaceMatchingService.representativeFaces(faces)
             guard Self.isAlive(friend), !identity.isEmpty else {
                 unusableFriendIDs.insert(friend.id)
                 Self.logger.warning("Couldn't rebuild a face for \(friend.name); skipping them")
                 continue
             }
             friend.identity = identity
+            rebuilt.insert(friend.id)
+            rebuiltThisLaunch.insert(friend.id)
+            Self.logger.info("Rebuilt \(friend.name)'s face from \(identity.count) of \(faces.count) faces in their first \(sample.count) photos")
+        }
+        save()
+
+        // 2. Every album photo, against everyone the app knows. Friends whose
+        //    faces couldn't be rebuilt aren't in `templates` (wrong model or rules).
+        var templates: [UUID: FaceTemplate] = [:]
+        for other in friends where Self.isAlive(other) && !unusableFriendIDs.contains(other.id) {
+            let current = rebuilt.contains(other.id) || other.identityVersion >= Friend.currentIdentityVersion
+            if current, let template = other.template { templates[other.id] = template }
+        }
+        for friend in stale where rebuilt.contains(friend.id) {
+            phase = .tidying(friend.name)
+            let matches = friend.photoMatches
+            let assets = Self.assets(withIDs: matches.map(\.assetID))
+            var keep = Set(matches.map(\.assetID).filter { assets[$0] == nil })   // gone from the library: nothing to judge
+            var someoneElse = 0, noOne = 0, noFace = 0
+            var verdicts = tidyVerdicts[friend.id] ?? [:]
+            for (id, kept) in verdicts where kept { keep.insert(id) }
+            let toJudge = matches.filter { verdicts[$0.assetID] == nil }
+            if !verdicts.isEmpty { Self.logger.info("Tidy \(friend.name): resuming, \(verdicts.count) photos already judged") }
+            var index = 0
+            while index < toJudge.count {
+                guard isCurrent(gen, control) else { return false }
+                if control.mustWait {
+                    try? await Task.sleep(for: .milliseconds(300))
+                    continue
+                }
+                let batch = toJudge[index..<min(index + control.workers, toJudge.count)]
+                index += batch.count
+                let checked = await withTaskGroup(of: (String, FaceEmbedding?).self, returning: [(String, FaceEmbedding?)].self) { group in
+                    for match in batch {
+                        guard let asset = assets[match.assetID] else { continue }
+                        let id = match.assetID
+                        let box = match.faceBoundingBox
+                        group.addTask { (id, await service.embedKnownFaces([(asset: asset, box: box)], limit: 1).first) }
+                    }
+                    var results: [(String, FaceEmbedding?)] = []
+                    for await result in group { results.append(result) }
+                    return results
+                }
+                for (id, face) in checked {
+                    guard let face else {
+                        noFace += 1
+                        keep.insert(id)
+                        verdicts[id] = true
+                        continue
+                    }
+                    let owner = FaceMatchingService.owner(of: face, among: templates)
+                    verdicts[id] = owner == friend.id
+                    switch owner {
+                    case .some(let owner) where owner == friend.id:
+                        keep.insert(id)
+                    case .some(let owner):
+                        someoneElse += 1
+                        let ownerName = friends.first { $0.id == owner }?.name ?? "?"
+                        Self.logger.info("Tidy \(friend.name): dropped \(id.prefix(8)), looks like \(ownerName)")
+                    case .none:
+                        noOne += 1
+                        Self.logger.info("Tidy \(friend.name): dropped \(id.prefix(8)), matches no one")
+                    }
+                }
+                tidyVerdicts[friend.id] = verdicts
+            }
+            guard isCurrent(gen, control), Self.isAlive(friend) else { return false }
+            let before = friend.photoMatches.count
+            friend.photoMatches.removeAll { !keep.contains($0.assetID) }
+            friend.identityVersion = Friend.currentIdentityVersion
+            tidyVerdicts[friend.id] = nil
             save()
+            Self.logger.info("Tidied \(friend.name)'s album: kept \(friend.photoMatches.count) of \(before) — \(someoneElse) looked more like another friend, \(noOne) no longer matched, \(noFace) had no face to check")
         }
 
-        var round = Round(friends: [:], identities: [:], known: [:])
-        for friend in all where Self.isAlive(friend) && !unusableFriendIDs.contains(friend.id) {
-            let identity = friend.identity
-            guard !identity.isEmpty else { continue }
-            round.friends[friend.id] = friend
-            round.identities[friend.id] = identity
-            round.known[friend.id] = Set(friend.photoMatches.map(\.assetID) + friend.excludedIDs)
+        // 3. Walk the whole library again under the new rules.
+        if friends.allSatisfy({ !Self.isAlive($0) || unusableFriendIDs.contains($0.id) || $0.identityVersion >= Friend.currentIdentityVersion }) {
+            state.walkStartedAt = Date()
+            state.walkBefore = nil
+            state.walkDone = false
+            for friend in friends where Self.isAlive(friend) { friend.catchUpBefore = friend.catchUpFloor }
+            save()
+            Self.logger.info("Albums tidied; walking the library again under the new rules")
         }
-        return round.friends.isEmpty ? nil : round
+        return true
     }
 
     /// The friend with the most photos still to catch up on — the focus friend
@@ -433,7 +560,7 @@ final class FriendRescanner {
 
         var result = FriendsSearchResult()
         if !candidates.isEmpty {
-            result = await service.findFriends(identities: round.identities, in: candidates, mode: .download, control: control) { friendID, face in
+            result = await service.findFriends(templates: round.templates, in: candidates, mode: .download, control: control) { friendID, face in
                 Task { @MainActor in FriendRescanner.shared.add(face, to: friendID) }
             }
             guard gen == generation else { return .stopped }
@@ -484,7 +611,7 @@ final class FriendRescanner {
         guard !candidates.isEmpty else { return true }
 
         // Matches land as they're found, so an album being waited on fills live.
-        let result = await service.findFriends(identities: round.identities, in: candidates, mode: .local, control: control) { friendID, face in
+        let result = await service.findFriends(templates: round.templates, in: candidates, mode: .local, control: control) { friendID, face in
             Task { @MainActor in FriendRescanner.shared.add(face, to: friendID) }
         }
         guard isCurrent(gen, control) else { return false }
@@ -531,6 +658,7 @@ final class FriendRescanner {
             case .idle: return nil
             case .newPhotos: parts.append("checking new photos")
             case .catchingUp(let name): parts.append("catching up \(name) · \(catchUpRemaining.formatted()) left")
+            case .tidying(let name): parts.append("tidying \(name)'s album")
             case .walking: parts.append("checking older photos · \(walkRemaining.formatted()) left")
             case .cloud: parts.append("downloading from iCloud")
             case .done: parts.append(cloudWaiting > 0 && isOffline ? "offline" : "up to date")
@@ -602,11 +730,18 @@ final class FriendRescanner {
         }
         backgroundRun = bgTask
         if !isRunning { start() }
-        let control = self.control
         bgTask.expirationHandler = {
-            control.stop()
-            Task { @MainActor in FriendRescanner.shared.finishBackgroundRun(success: false) }
+            Task { @MainActor in FriendRescanner.shared.backgroundRunExpired() }
         }
+    }
+
+    /// iOS took the long run's time back. iOS can start that run while the app
+    /// is open (charging, a debugger attached) and expire it seconds later —
+    /// then the scan is the foreground's and carries on; only a scan that's
+    /// really in the background stops.
+    private func backgroundRunExpired() {
+        if UIApplication.shared.applicationState != .active { control.stop() }
+        finishBackgroundRun(success: false)
     }
 
     private func finishBackgroundRun(success: Bool) {

@@ -37,7 +37,7 @@ from PIL import Image
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-MLPACKAGE_PATH = REPO_ROOT / "angryFriend" / "MobileFaceNet.mlpackage"
+MLPACKAGE_PATH = REPO_ROOT / "angryFriend" / "FaceNetR50.mlpackage"
 DEBUG_DIR = REPO_ROOT / "debug_chips"
 TEST_DATA_DIR = REPO_ROOT / "test_data" / "lfw_pairs"
 
@@ -1300,7 +1300,7 @@ def main():
 
     mlpkg = Path(args.mlpackage)
     if not mlpkg.exists():
-        print(f"ERROR: MobileFaceNet.mlpackage not found at {mlpkg}"); sys.exit(1)
+        print(f"ERROR: face model .mlpackage not found at {mlpkg}"); sys.exit(1)
 
     coreml = CoreMLModel(mlpkg)
 

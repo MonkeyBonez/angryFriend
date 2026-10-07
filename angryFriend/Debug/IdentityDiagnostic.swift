@@ -23,9 +23,11 @@ enum IdentityDiagnostic {
 
         let names = friends.map(\.name)
         let identities = friends.map(\.identity)
+        var templates: [UUID: FaceTemplate] = [:]
+        for friend in friends { if let template = friend.template { templates[friend.id] = template } }
         let thr = FaceMatchingService.matchThreshold
         let summary = friends.map { "\($0.name): album \($0.photoMatches.count), identity \($0.identity.count) faces, excluded \($0.excludedIDs.count)" }
-        logger.info("Diag: \(friends.count) friends — \(summary.joined(separator: " | "))")
+        logger.info("Diag: \(friends.count) friends (threshold \(thr), margin \(FaceMatchingService.matchMargin)) — \(summary.joined(separator: " | "))")
 
         // 1. Stored identities against each other, and within themselves.
         for a in friends.indices {
@@ -95,22 +97,23 @@ enum IdentityDiagnostic {
                     continue
                 }
                 let ownEach = identities[fi].map { $0.cosineSimilarity(to: embedding) }
-                let own = ownEach.max() ?? 0
+                let own = friends[fi].template?.similarity(to: embedding) ?? 0
                 if let k = ownEach.indices.max(by: { ownEach[$0] < ownEach[$1] }) {
                     support[k] += 1
                     let rest = ownEach.enumerated().filter { $0.offset != k }.map(\.element).max() ?? 0
                     if rest < 0.2 { weakSupport[k] += 1; if weakIDs[k].count < 12 { weakIDs[k].append(id8) } }
                 }
                 var otherName = "-", otherSim: Float = -1
-                for (gi, g) in identities.enumerated() where gi != fi {
-                    let s = g.map { $0.cosineSimilarity(to: embedding) }.max() ?? -1
+                for (gi, other) in friends.enumerated() where gi != fi {
+                    let s = other.template?.similarity(to: embedding) ?? -1
                     if s > otherSim { otherSim = s; otherName = names[gi] }
                 }
                 let verdict: String
-                if otherSim > own { verdict = "WRONG" }
-                else if own < thr { verdict = "LOW" }
-                else if otherSim >= thr || own - otherSim < 0.05 { verdict = "CLOSE" }
-                else { verdict = "OK" }
+                switch FaceMatchingService.owner(of: embedding, among: templates) {
+                case .some(let owner) where owner == friend.id: verdict = "OK"
+                case .some: verdict = "WRONG"
+                case .none: verdict = otherSim > own ? "WRONG" : (own < thr ? "LOW" : "CLOSE")
+                }
                 counts[verdict, default: 0] += 1
                 if verdict == "WRONG" { wrongIDs.append(id8) }
                 logger.info("Diag photo \(names[fi]) \(id8) face \(job.faceWidth)px own \(ownEach.map(fmt).joined(separator: "/")) other \(otherName) \(fmt(otherSim)) → \(verdict)")
