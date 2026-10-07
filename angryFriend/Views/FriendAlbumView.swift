@@ -93,10 +93,11 @@ private struct FriendAlbumContent: View {
             isPresented: $showDeleteConfirm,
             titleVisibility: .visible
         ) {
-            Button("Remove", role: .destructive, action: removeSelected)
+            Button("Not \(displayName)", role: .destructive) { removeSelected(notThem: true) }
+            Button("Just remove from the game") { removeSelected(notThem: false) }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This only removes them from the game — they stay in your photo library.")
+            Text("“Not \(displayName)” also teaches the app to skip that face from now on. Either way, the photos stay in your library.")
         }
         .alert("Add Photos", isPresented: Binding(
             get: { addStatusMessage != nil },
@@ -265,7 +266,11 @@ private struct FriendAlbumContent: View {
 
     // MARK: - Remove
 
-    private func removeSelected() {
+    /// Removes the selected photos from the album. With `notThem`, the face in
+    /// each one is also kept as a "Not them" face, so the scan stops adding
+    /// that person — their other photos included — to this friend.
+    private func removeSelected(notThem: Bool) {
+        let removed = friend.photoMatches.filter { selectedIDs.contains($0.assetID) }
         friend.photoMatches.removeAll { selectedIDs.contains($0.assetID) }
         // Removed on purpose: the rescan must not quietly put these back.
         friend.excludedIDs.append(contentsOf: selectedIDs.filter { !friend.excludedIDs.contains($0) })
@@ -275,6 +280,29 @@ private struct FriendAlbumContent: View {
             selectedIDs = []
         }
         Haptics.done()
+        if notThem { rememberNotThem(removed) }
+    }
+
+    /// Embeds the face at each removed photo's stored box (the one the app took
+    /// for this friend) and adds it to the friend's "Not them" faces. Runs after
+    /// the photos are already gone from the grid.
+    private func rememberNotThem(_ removed: [PhotoMatch]) {
+        let ids = removed.map(\.assetID)
+        var byID: [String: PHAsset] = [:]
+        PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil).enumerateObjects { asset, _, _ in
+            byID[asset.localIdentifier] = asset
+        }
+        let known = removed.compactMap { match in byID[match.assetID].map { (asset: $0, box: match.faceBoundingBox) } }
+        guard !known.isEmpty else { return }
+        let friend = self.friend
+        let modelContext = self.modelContext
+        Task {
+            guard let service = try? FaceMatchingService() else { return }
+            let faces = await service.embedKnownFaces(known, limit: known.count)
+            guard !faces.isEmpty, !friend.isDeleted else { return }
+            friend.negatives += faces
+            try? modelContext.save()
+        }
     }
 
     // MARK: - Add (deduped, identity-checked)

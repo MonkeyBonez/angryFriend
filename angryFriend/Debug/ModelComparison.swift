@@ -41,6 +41,16 @@ enum ModelComparison {
         var embeddings: [FaceEmbedding?]
     }
 
+    private static func appendLine(_ text: String, to url: URL) {
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            try? handle.close()
+        } else {
+            try? ("friend\tid\talbumIndex\tnewestFirst\tfromBottomRight\tcreated\n" + text).write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
     @MainActor
     static func runIfRequested(context: ModelContext) async {
         guard ProcessInfo.processInfo.arguments.contains("-compareModels") else { return }
@@ -79,9 +89,21 @@ enum ModelComparison {
             }
             // Very large albums: the first 24 (the identity's source) plus an even sample, 600 in all.
             var indices = Array(matches.indices)
-            // `-recentOnly`: the identity's source plus the newest 150 — what a scan just added.
+            // Every album photo's shot date, newest first as the album shows them.
+            let byDate = matches.indices.sorted {
+                (assets[matches[$0].assetID]?.creationDate ?? .distantPast) > (assets[matches[$1].assetID]?.creationDate ?? .distantPast)
+            }
+            let dateFormatter = ISO8601DateFormatter()
+            var datesTSV = ""
+            for (position, i) in byDate.enumerated() {
+                let date = assets[matches[i].assetID]?.creationDate.map { dateFormatter.string(from: $0) } ?? "-"
+                datesTSV += "\(names[fi])\t\(matches[i].assetID.prefix(8))\t\(i)\t\(position + 1)\t\(byDate.count - position)\t\(date)\n"
+            }
+            appendLine(datesTSV, to: dir.appendingPathComponent("dates.tsv"))
+            // `-recentOnly`: the identity's source, the newest 150 added (what a scan just
+            // added), and the 30 oldest by date (the bottom of the album grid).
             if ProcessInfo.processInfo.arguments.contains("-recentOnly") {
-                indices = Array(Set(indices.prefix(24)).union(indices.suffix(150))).sorted()
+                indices = Array(Set(indices.prefix(24)).union(indices.suffix(150)).union(byDate.suffix(30))).sorted()
             } else if indices.count > 800 {
                 let rest = Array(indices.dropFirst(24))
                 let step = Double(rest.count) / 576

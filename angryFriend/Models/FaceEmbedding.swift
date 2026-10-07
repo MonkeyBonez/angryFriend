@@ -25,15 +25,27 @@ struct FaceEmbedding: Sendable {
 /// What a friend looks like, for matching: the mean of their stored faces.
 /// Scoring a face against the mean beats "best of a few single faces" — a
 /// single face carries its own lighting and angle, which a stranger can share.
+/// `negatives` are faces the user said aren't this friend ("Not them").
 nonisolated struct FaceTemplate: Sendable {
     let mean: FaceEmbedding
+    let negatives: [FaceEmbedding]
 
-    init?(faces: [FaceEmbedding]) {
+    init?(faces: [FaceEmbedding], negatives: [FaceEmbedding] = []) {
         guard let mean = FaceEmbedding.mean(of: faces) else { return nil }
         self.mean = mean
+        self.negatives = negatives
     }
 
     func similarity(to face: FaceEmbedding) -> Float {
         mean.cosineSimilarity(to: face)
+    }
+
+    /// The face looks more like someone the user said isn't this friend than
+    /// like the friend. One "Not them" on a stranger also turns away their
+    /// other photos: same-person faces sit far closer to each other (0.6–0.9)
+    /// than a stranger does to the friend (≈0.3).
+    func rejects(_ face: FaceEmbedding) -> Bool {
+        let own = similarity(to: face)
+        return negatives.contains { $0.cosineSimilarity(to: face) > own }
     }
 }

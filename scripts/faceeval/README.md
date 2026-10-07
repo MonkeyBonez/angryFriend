@@ -28,3 +28,21 @@ exclusive assignment / margin / size gate, with a threshold sweep; mix-ups by fa
 identity contamination at creation; template growth. Keys: `app` = the shipped CoreML model (ResNet50 since 2026-10-07),
 `mbf`/`r50`/`r100` = MobileFaceNet / ResNet50 / ResNet100 via ONNX; `_vis2pt` = the app's Vision 2-pt alignment,
 `_vis5a` = 5-pt from Vision landmarks, `_5pt` = reference SCRFD 5-pt.
+
+## Real-phone problem cases
+
+`test_data/phone_cases/` (gitignored — faces of real people) holds face chips pulled off the phone
+with `-compareModels` (`xcrun devicectl device copy from --domain-type appDataContainer
+--domain-identifier Snehal.angryFriend --source Documents/diag/compare …`), `album_now.tsv`
+(every album photo now; the run's `dates.tsv`) and `cases.tsv`: each friend's identity source
+(first 24 album photos), confirmed wrong adds (A-Train: a man in orange-tinted glasses, a group
+photo #18; Big V: 23 photos of Friend 4), unverified wrong adds (Ames' old stray face) and
+confirmed right ones.
+
+```
+python3 scripts/faceeval/phone_cases.py --verbose
+```
+replays the app's rule with the shipped CoreML model and prints, per candidate rule, wrong adds
+still let in vs current album photos lost, then what one "Not them" mark turns away. Add new
+cases to `cases.tsv` as they're found (`-compareModels -recentOnly` pulls the newest adds plus
+the 30 oldest photos per album in ~80 s).

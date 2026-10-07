@@ -415,8 +415,9 @@ actor FaceMatchingService {
     }
 
     /// Who, of everyone the app knows, a face belongs to: the friend it looks
-    /// most like, if that clears the bar and beats the runner-up by the margin.
-    /// Nil when it's nobody's, or too close to call.
+    /// most like, if that clears the bar and beats the runner-up by the margin,
+    /// and isn't more like one of that friend's "Not them" faces. Nil when it's
+    /// nobody's, or too close to call.
     nonisolated static func owner(of face: FaceEmbedding, among templates: [UUID: FaceTemplate],
                                   threshold: Float = matchThreshold) -> UUID? {
         var top: (id: UUID, sim: Float)? = nil
@@ -430,7 +431,8 @@ actor FaceMatchingService {
                 top = (id, sim)
             }
         }
-        guard let top, top.sim >= threshold, top.sim - second >= matchMargin else { return nil }
+        guard let top, top.sim >= threshold, top.sim - second >= matchMargin,
+              templates[top.id]?.rejects(face) != true else { return nil }
         return top.id
     }
 

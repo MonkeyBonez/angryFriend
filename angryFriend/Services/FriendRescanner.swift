@@ -383,6 +383,9 @@ final class FriendRescanner {
                 continue
             }
             friend.identity = identity
+            // "Not them" faces come from the old rules' model; they can't be compared with
+            // the new one's. (The photos stay excluded; only the face memory goes.)
+            if friend.identityVersion < Friend.currentIdentityVersion { friend.negatives = [] }
             rebuilt.insert(friend.id)
             rebuiltThisLaunch.insert(friend.id)
             Self.logger.info("Rebuilt \(friend.name)'s face from \(identity.count) of \(faces.count) faces in their first \(sample.count) photos")
