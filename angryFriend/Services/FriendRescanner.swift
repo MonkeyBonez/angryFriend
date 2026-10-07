@@ -302,7 +302,7 @@ final class FriendRescanner {
             save()
             return false
         }
-        return friends.contains { $0.catchUpFloor == nil || $0.needsCatchUp || $0.identityVersion < Friend.currentIdentityVersion }
+        return friends.contains { $0.catchUpFloor == nil || $0.needsCatchUp || $0.identityVersion < Friend.currentIdentityVersion || $0.needsNotThemRecheck }
             || !state.walkDone
             || (!state.pendingCloudIDs.isEmpty && NetworkMonitor.shared.isOnline)
             || library.count(changedAfter: state.newestModifiedSeen) > 0
@@ -352,13 +352,24 @@ final class FriendRescanner {
     /// compared against faces from the old rules (or an old model, whose
     /// embeddings mean nothing to the new one). False if the scan stopped
     /// part-way; whatever wasn't finished is redone next time.
+    ///
+    /// The same album check (step 2 alone) runs after the user marks faces
+    /// "Not them": that person's other photos in the album go too.
     private func tidyAlbums(_ friends: [Friend], state: ScanState, service: FaceMatchingService, generation gen: Int, control: ScanControl) async -> Bool {
         let stale = friends.filter {
             Self.isAlive($0) && !unusableFriendIDs.contains($0.id)
                 && ($0.identityVersion < Friend.currentIdentityVersion || $0.identity.isEmpty)
         }
-        guard !stale.isEmpty else { return true }
-        Self.logger.info("Matching rules changed: rebuilding faces for \(stale.map(\.name).joined(separator: ", "))")
+        let notThem = friends.filter {
+            Self.isAlive($0) && !unusableFriendIDs.contains($0.id) && !stale.contains($0) && $0.needsNotThemRecheck
+        }
+        guard !stale.isEmpty || !notThem.isEmpty else { return true }
+        if !stale.isEmpty {
+            Self.logger.info("Matching rules changed: rebuilding faces for \(stale.map(\.name).joined(separator: ", "))")
+        }
+        if !notThem.isEmpty {
+            Self.logger.info("Re-checking albums against new \"Not them\" faces: \(notThem.map { "\($0.name) (\($0.negatives.count))" }.joined(separator: ", "))")
+        }
 
         // 1. Faces, for every stale friend first. A friend whose new faces are
         //    already stored (a tidy cut short in step 2) keeps them.
@@ -399,7 +410,7 @@ final class FriendRescanner {
             let current = rebuilt.contains(other.id) || other.identityVersion >= Friend.currentIdentityVersion
             if current, let template = other.template { templates[other.id] = template }
         }
-        for friend in stale where rebuilt.contains(friend.id) {
+        for friend in stale.filter({ rebuilt.contains($0.id) }) + notThem {
             phase = .tidying(friend.name)
             let matches = friend.photoMatches
             let assets = Self.assets(withIDs: matches.map(\.assetID))
@@ -447,7 +458,8 @@ final class FriendRescanner {
                         Self.logger.info("Tidy \(friend.name): dropped \(id.prefix(8)), looks like \(ownerName)")
                     case .none:
                         noOne += 1
-                        Self.logger.info("Tidy \(friend.name): dropped \(id.prefix(8)), matches no one")
+                        let why = templates[friend.id]?.rejects(face) == true ? "looks like a \"Not them\" face" : "matches no one"
+                        Self.logger.info("Tidy \(friend.name): dropped \(id.prefix(8)), \(why)")
                     }
                 }
                 tidyVerdicts[friend.id] = verdicts
@@ -456,13 +468,15 @@ final class FriendRescanner {
             let before = friend.photoMatches.count
             friend.photoMatches.removeAll { !keep.contains($0.assetID) }
             friend.identityVersion = Friend.currentIdentityVersion
+            friend.notThemChecked = friend.negatives.count
             tidyVerdicts[friend.id] = nil
             save()
             Self.logger.info("Tidied \(friend.name)'s album: kept \(friend.photoMatches.count) of \(before) — \(someoneElse) looked more like another friend, \(noOne) no longer matched, \(noFace) had no face to check")
         }
 
-        // 3. Walk the whole library again under the new rules.
-        if friends.allSatisfy({ !Self.isAlive($0) || unusableFriendIDs.contains($0.id) || $0.identityVersion >= Friend.currentIdentityVersion }) {
+        // 3. Walk the whole library again under the new rules (not for "Not them":
+        //    the scan only ever adds, and it already turns those faces away).
+        if !stale.isEmpty, friends.allSatisfy({ !Self.isAlive($0) || unusableFriendIDs.contains($0.id) || $0.identityVersion >= Friend.currentIdentityVersion }) {
             state.walkStartedAt = Date()
             state.walkBefore = nil
             state.walkDone = false

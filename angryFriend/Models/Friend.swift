@@ -34,6 +34,7 @@ final class Friend {
     var photoMatches: [PhotoMatch] = [PhotoMatch]()  // every photo this friend was found in — picked or found by rescan
     var identityData: Data? = nil           // up to 10 face embeddings, flat [Float] bytes — the template a rescan matches against is their mean
     var negativeData: Data? = nil           // faces the user said aren't this friend ("Not them"), same encoding as identityData
+    var notThemChecked: Int = 0             // how many "Not them" faces the album was last re-checked against; -1 → re-check
     var identityVersion: Int = 0            // which matching rules built `identityData` and checked the album; below `currentIdentityVersion` → rebuilt and re-checked once
     var catchUpBefore: Date? = nil          // own walk back through photos the shared walk passed before this friend joined
     var catchUpFloor: Date? = nil           // ...down to here, where the shared walk was; nil → not joined the scan yet
@@ -65,6 +66,9 @@ extension Friend {
     /// Matching template: the mean of the stored faces, plus the "Not them"
     /// faces. Nil until there are faces.
     var template: FaceTemplate? { FaceTemplate(faces: identity, negatives: negatives) }
+
+    /// New "Not them" faces since the album was last re-checked against them.
+    var needsNotThemRecheck: Bool { notThemChecked != negatives.count }
 
     /// Most "Not them" faces kept per friend; the oldest go first.
     static let negativeLimit = 50

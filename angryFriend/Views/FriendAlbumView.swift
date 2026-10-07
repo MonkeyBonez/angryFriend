@@ -285,7 +285,8 @@ private struct FriendAlbumContent: View {
 
     /// Embeds the face at each removed photo's stored box (the one the app took
     /// for this friend) and adds it to the friend's "Not them" faces. Runs after
-    /// the photos are already gone from the grid.
+    /// the photos are already gone from the grid; the scan then re-checks the
+    /// rest of the album against them.
     private func rememberNotThem(_ removed: [PhotoMatch]) {
         let ids = removed.map(\.assetID)
         var byID: [String: PHAsset] = [:]
@@ -301,7 +302,9 @@ private struct FriendAlbumContent: View {
             let faces = await service.embedKnownFaces(known, limit: known.count)
             guard !faces.isEmpty, !friend.isDeleted else { return }
             friend.negatives += faces
+            friend.notThemChecked = -1   // the scan re-checks the album: that person's other photos go too
             try? modelContext.save()
+            FriendRescanner.shared.ensureRunning()
         }
     }
 
