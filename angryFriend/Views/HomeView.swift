@@ -175,7 +175,7 @@ struct HomeView: View {
         .animation(.spring(response: 0.3, dampingFraction: 0.75), value: selected.isEmpty)
     }
 
-    /// The MULTIPLE SUSPECTS toggle (filled while on), with DEAL beside it once
+    /// The MULTI FRIEND toggle (filled while on), with PLAY beside it once
     /// someone's picked.
     private var multipleSuspectsRow: some View {
         HStack(spacing: 10) {
@@ -188,21 +188,18 @@ struct HomeView: View {
                         selecting = true
                     }
                 } label: {
-                    HStack(spacing: 8) {
-                        MiniStickerFan(friends: Array(savedFriends.prefix(3)), size: 20, maxShown: 3)
-                        Text("MULTIPLE SUSPECTS")
-                    }
+                    Text("MULTI FRIEND")
                 }
                 .buttonStyle(StickerButtonStyle(background: selecting ? StickerTheme.ink : .white,
                                                 foreground: selecting ? .white : StickerTheme.ink,
                                                 size: 12, cornerRadius: 999, fullWidth: false))
                 .rotationEffect(.degrees(selecting ? 1.5 : -1.5))
-                .accessibilityLabel("Multiple suspects")
+                .accessibilityLabel("Multi friend")
                 .accessibilityValue(selecting ? "On" : "Off")
                 .accessibilityHint("Pick several friends to mix into one round")
 
                 if selecting && !selectedFriends.isEmpty {
-                    Button("DEAL", action: dealRoster)
+                    Button("PLAY", action: dealRoster)
                         .buttonStyle(StickerButtonStyle(background: StickerTheme.flame, size: 13, cornerRadius: 999, fullWidth: false))
                         .transition(.scale(scale: 0.6).combined(with: .opacity))
                 }
