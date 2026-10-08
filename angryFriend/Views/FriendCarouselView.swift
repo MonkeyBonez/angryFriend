@@ -40,11 +40,15 @@ struct FriendCarouselView: View {
                     .popIn(delay: 0.1 + Double(index) * 0.06)
                 }
 
-                // The emoji pal never leaves the line-up — a practice round is
-                // always one tap away, even with a full roster.
-                EmojiPalSticker(index: friends.count, isEnabled: selection == nil, action: onDemo)
-                    .popIn(delay: 0.1 + Double(friends.count) * 0.06)
+                // The emoji pal stays in the line-up so a practice round is always
+                // one tap away — except while picking suspects, where it can't be one.
+                if selection == nil {
+                    EmojiPalSticker(index: friends.count, action: onDemo)
+                        .popIn(delay: 0.1 + Double(friends.count) * 0.06)
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
+                }
             }
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: selection == nil)
             .padding(.horizontal, 28)
             .padding(.vertical, 10)
         }
