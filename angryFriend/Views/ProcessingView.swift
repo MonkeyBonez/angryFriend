@@ -514,8 +514,6 @@ struct ProcessingView: View {
         // What the background scan matches the rest of the library against.
         friend.identity = discovery.identity
         friend.pendingPickedIDs = discovery.unprocessed.map(\.localIdentifier)
-        // Newest at the front of the line-up, ahead of any order the user dragged into place.
-        friend.sortOrder = (savedFriends.map(\.sortOrder).min() ?? 0) - 1
         modelContext.insert(friend)
         try? modelContext.save()
         committedFriend = friend

@@ -40,7 +40,6 @@ final class Friend {
     var catchUpFloor: Date? = nil           // ...down to here, where the shared walk was; nil → not joined the scan yet
     var excludedIDs: [String] = [String]()  // removed from the album on purpose — a rescan must never add them back
     var pendingPickedIDs: [String] = [String]()  // picked photos discovery stopped before reaching; the scan checks them first
-    var sortOrder: Int = 0                  // place in the home line-up; lower first, ties newest first
 
     init(name: String, stickerData: Data, photoMatches: [PhotoMatch]) {
         self.id = UUID()
