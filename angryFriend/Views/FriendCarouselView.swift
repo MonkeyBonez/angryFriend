@@ -2,8 +2,15 @@ import SwiftUI
 import UIKit
 import SwiftData
 
+/// Picking several friends for one round: who's checked, and what a tap does.
+struct FriendSelection {
+    var selected: Set<UUID>
+    var onToggle: (Friend) -> Void
+}
+
 /// The suspect line-up. Each friend is a die-cut sticker: white border, ink ring,
 /// hard shadow, leaning at a fixed angle so the row looks slapped together.
+/// With a `selection`, tapping checks friends instead of playing them.
 struct FriendCarouselView: View {
     let friends: [Friend]
     let onSelect: (Friend) -> Void
@@ -11,11 +18,12 @@ struct FriendCarouselView: View {
     let onEdit: (Friend) -> Void
     let onAddNew: () -> Void
     let onDemo: () -> Void
+    var selection: FriendSelection? = nil
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(alignment: .top, spacing: 16) {
-                AddStickerButton(action: onAddNew)
+                AddStickerButton(isEnabled: selection == nil, action: onAddNew)
                     .popIn(delay: 0.05)
 
                 ForEach(Array(friends.enumerated()), id: \.element.id) { index, friend in
@@ -24,14 +32,17 @@ struct FriendCarouselView: View {
                         index: index,
                         onSelect: { onSelect(friend) },
                         onHold: { onHold(friend) },
-                        onEdit: { onEdit(friend) }
+                        onEdit: { onEdit(friend) },
+                        selecting: selection != nil,
+                        isSelected: selection?.selected.contains(friend.id) ?? false,
+                        onToggle: { selection?.onToggle(friend) }
                     )
                     .popIn(delay: 0.1 + Double(index) * 0.06)
                 }
 
                 // The emoji pal never leaves the line-up — a practice round is
                 // always one tap away, even with a full roster.
-                EmojiPalSticker(index: friends.count, action: onDemo)
+                EmojiPalSticker(index: friends.count, isEnabled: selection == nil, action: onDemo)
                     .popIn(delay: 0.1 + Double(friends.count) * 0.06)
             }
             .padding(.horizontal, 28)
@@ -49,6 +60,9 @@ private struct FriendSticker: View {
     let onSelect: () -> Void
     let onHold: () -> Void
     let onEdit: () -> Void
+    var selecting = false
+    var isSelected = false
+    var onToggle: () -> Void = {}
 
     @State private var punch = false
 
@@ -72,44 +86,75 @@ private struct FriendSticker: View {
                 .background(StickerTheme.tile(index))
                 .clipShape(Circle())
                 .overlay(Circle().stroke(.white, lineWidth: 3.5))
-                .overlay(Circle().stroke(StickerTheme.ink, lineWidth: 2).padding(-3.5))
+                .overlay(Circle().stroke(StickerTheme.ink, lineWidth: checked ? 4 : 2).padding(-3.5))
                 .hardShadow(StickerTheme.ink.opacity(0.35), x: 3, y: 4)
                 .rotationEffect(.degrees(StickerTheme.lean(index)))
-                .scaleEffect(punch ? 0.86 : 1)
+                .scaleEffect(punch ? 0.86 : (checked ? 1.06 : 1))
                 .contentShape(Circle())
                 .onTapGesture {
+                    if selecting {
+                        Haptics.flick()
+                        onToggle()
+                        return
+                    }
                     Haptics.peel()
                     withAnimation(.spring(response: 0.16, dampingFraction: 0.5)) { punch = true }
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.5).delay(0.12)) { punch = false }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { onSelect() }
                 }
                 .onLongPressGesture(minimumDuration: 0.4) {
+                    guard !selecting else { return }
                     Haptics.press()
                     onHold()
                 }
 
-                Button {
-                    Haptics.peel()
-                    onEdit()
-                } label: {
-                    Image(systemName: "pencil")
-                        .font(.system(size: 11, weight: .black))
-                        .foregroundStyle(.white)
-                        .frame(width: 24, height: 24)
-                        .background(StickerTheme.blue, in: Circle())
-                        .overlay(Circle().stroke(StickerTheme.ink, lineWidth: 2))
+                if selecting {
+                    if isSelected {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 12, weight: .black))
+                            .foregroundStyle(.white)
+                            .frame(width: 26, height: 26)
+                            .background(StickerTheme.mint, in: Circle())
+                            .overlay(Circle().stroke(StickerTheme.ink, lineWidth: 2))
+                            .offset(x: 5, y: -4)
+                            .transition(.scale(scale: 0.2).combined(with: .opacity))
+                            .allowsHitTesting(false)
+                    }
+                } else {
+                    Button {
+                        Haptics.peel()
+                        onEdit()
+                    } label: {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 11, weight: .black))
+                            .foregroundStyle(.white)
+                            .frame(width: 24, height: 24)
+                            .background(StickerTheme.blue, in: Circle())
+                            .overlay(Circle().stroke(StickerTheme.ink, lineWidth: 2))
+                    }
+                    .buttonStyle(.plain)
+                    .offset(x: 5, y: -4)
+                    .accessibilityLabel("Edit \(displayName)")
+                    .transition(.opacity)
                 }
-                .buttonStyle(.plain)
-                .offset(x: 5, y: -4)
-                .accessibilityLabel("Edit \(displayName)")
             }
 
-            TapeLabel(text: displayName, tilt: StickerTheme.lean(index + 3))
+            TapeLabel(text: displayName, tilt: StickerTheme.lean(index + 3),
+                      background: checked ? StickerTheme.ink : .white,
+                      foreground: checked ? .white : StickerTheme.ink)
         }
         .frame(width: size + 8)
+        .opacity(selecting && !isSelected ? 0.45 : 1)
+        .animation(.spring(response: 0.25, dampingFraction: 0.65), value: isSelected)
+        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: selecting)
         .accessibilityElement(children: .contain)
-        .accessibilityHint("Tap to play, press and hold to open their album")
+        .accessibilityAddTraits(checked ? [.isSelected] : [])
+        .accessibilityHint(selecting
+            ? (isSelected ? "Tap to leave them out" : "Tap to add them to the round")
+            : "Tap to play, press and hold to open their album")
     }
+
+    private var checked: Bool { selecting && isSelected }
 
     private var displayName: String {
         friend.name.isEmpty ? "Friend" : friend.name
@@ -124,6 +169,7 @@ private struct FriendSticker: View {
 struct EmojiPalSticker: View {
     var index: Int = 0
     var size: CGFloat = 78
+    var isEnabled: Bool = true
     let action: () -> Void
 
     @State private var punch = false
@@ -142,6 +188,7 @@ struct EmojiPalSticker: View {
                 .scaleEffect(punch ? 0.86 : 1)
                 .contentShape(Circle())
                 .onTapGesture {
+                    guard isEnabled else { return }
                     Haptics.peel()
                     withAnimation(.spring(response: 0.16, dampingFraction: 0.5)) { punch = true }
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.5).delay(0.12)) { punch = false }
@@ -152,6 +199,8 @@ struct EmojiPalSticker: View {
                       background: StickerTheme.blue, foreground: .white)
         }
         .frame(width: size + 8)
+        .opacity(isEnabled ? 1 : 0.4)
+        .animation(.easeOut(duration: 0.2), value: isEnabled)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Emoji Pal")
         .accessibilityHint("Tap to play a practice round with emoji faces")
@@ -162,6 +211,7 @@ struct EmojiPalSticker: View {
 // MARK: - Add new
 
 private struct AddStickerButton: View {
+    var isEnabled: Bool = true
     let action: () -> Void
     private let size: CGFloat = 78
 
@@ -188,6 +238,9 @@ private struct AddStickerButton: View {
             .frame(width: size + 8)
         }
         .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .opacity(isEnabled ? 1 : 0.4)
+        .animation(.easeOut(duration: 0.2), value: isEnabled)
         .accessibilityLabel("Add a new friend")
     }
 }

@@ -14,10 +14,21 @@ struct ResultView: View {
         return appState.gameModel.cards[idx]
     }
 
+    /// Whose face the angry card was: with several friends in the deck, the
+    /// card knows; otherwise it's the one friend.
+    private var losingFriend: Friend? {
+        if let id = losingCard?.friendID, let friend = appState.roster.first(where: { $0.id == id }) {
+            return friend
+        }
+        return appState.roster.first
+    }
+
     private var friendName: String {
-        let name = appState.currentFriend?.name ?? ""
+        let name = losingFriend?.name ?? ""
         return name.isEmpty ? "Your friend" : name
     }
+
+    private var isGroupRound: Bool { appState.roster.count > 1 }
 
     private var isDemo: Bool { appState.isDemoRound }
 
@@ -81,6 +92,17 @@ struct ResultView: View {
                     .padding(.top, 18)
                     .opacity(cardIn ? 1 : 0)
 
+                if isGroupRound {
+                    VStack(spacing: 6) {
+                        Text("played with")
+                            .font(.sticker(10.5, .medium))
+                            .foregroundStyle(StickerTheme.ink.opacity(0.65))
+                        RosterRow(friends: appState.roster, size: 22)
+                    }
+                    .padding(.top, 14)
+                    .opacity(cardIn ? 1 : 0)
+                }
+
                 Spacer(minLength: 20)
 
                 VStack(spacing: 14) {
@@ -111,8 +133,8 @@ struct ResultView: View {
                         }
                         .buttonStyle(StickerButtonStyle(background: StickerTheme.flame))
 
-                        Button(action: startOver) {
-                            Text("pick a different friend")
+                        Button(action: isGroupRound ? changeLineup : startOver) {
+                            Text(isGroupRound ? "change the lineup" : "pick a different friend")
                                 .font(.sticker(12.5, .bold))
                                 .foregroundStyle(StickerTheme.ink.opacity(0.75))
                                 .underline()
@@ -165,9 +187,15 @@ struct ResultView: View {
         appState.gameModel.reset()
         appState.pendingPhotoIDs = []
         appState.usedPhotoIDs = []
-        appState.currentFriend = nil
+        appState.roster = []
         appState.isDemoRound = false
         appState.screen = .home
+    }
+
+    /// Back home with the same friends already picked, to add or drop some.
+    private func changeLineup() {
+        appState.resumeSelection = appState.roster.map(\.id)
+        startOver()
     }
 
     private func addRealFriend() {

@@ -12,7 +12,12 @@ final class AppState {
     var gameModel = GameModel()
     var cardCount: Int = 12
 
-    var currentFriend: Friend? = nil       // the friend currently being played
+    var roster: [Friend] = []              // friends in the round being dealt/played; empty → new friend or demo
+    var currentFriend: Friend? {           // single-friend view of the roster, for older call sites
+        get { roster.first }
+        set { roster = newValue.map { [$0] } ?? [] }
+    }
+    var resumeSelection: [UUID]? = nil     // "change the lineup": Home opens select mode with these checked
     var usedPhotoIDs: Set<String> = []     // photoMatches already used this session, so rounds vary
 
     var pendingPhotoIDs: [String] = []     // freshly picked photo identifiers, awaiting identity discovery
@@ -29,7 +34,7 @@ final class AppState {
     /// Deals a grid of emoji faces and goes straight to the table — there's
     /// nothing to identify or cut out, so `.processing` is skipped.
     func startDemoRound() {
-        currentFriend = nil
+        roster = []
         usedPhotoIDs = []
         pendingPhotoIDs = []
         isDemoRound = true

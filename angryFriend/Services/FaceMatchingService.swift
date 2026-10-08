@@ -19,6 +19,19 @@ struct FriendPhotoMatch {
 struct IdentityDiscoveryResult {
     let identity: [FaceEmbedding]      // up to `identityLimit` representative faces of the winning identity, most central first
     let matches: [FriendPhotoMatch]    // every input photo the identity was found in
+    var unprocessed: [PHAsset] = []    // picks never looked at because discovery committed early; empty after a full pass
+}
+
+/// When discovery may stop before the last pick: one person clearly leads,
+/// some of their photos are close-ups, and they're already in enough photos
+/// for a round. Group-only evidence never commits.
+nonisolated struct EarlyCommitRule: Sendable {
+    var minPhotosWithFaces = 10        // look at least this far before judging
+    var minCoverage: Float = 0.8       // share of face-bearing photos the leader is in
+    var minLead = 3                    // photos ahead of the runner-up
+    var minSoloish = 3                 // leader's photos where they're alone or clearly the main face
+    var soloWidthFactor: CGFloat = 1.5 // "clearly the main face": this much wider than every other face
+    var minPhotos: Int                 // photos needed for a round (the card count)
 }
 
 /// One photo a rescan found the friend in. Plain values so it can cross actors.
@@ -444,24 +457,33 @@ actor FaceMatchingService {
     // other people also appear in some of the shots. Runs across ALL provided
     // assets (no random sampling) so a photo that only has the friend in a
     // group shot still counts as evidence.
+    /// One looked-at photo's faces: index into the picked assets, then each
+    /// face's embedding and Vision box.
+    typealias PhotoFaces = (photo: Int, faces: [(embedding: FaceEmbedding, box: CGRect)])
+
+    /// With `earlyCommit`, stops starting new photos once the rule says the
+    /// person is clear (photos already in flight still count); the photos never
+    /// started come back as `unprocessed`. Without it, every photo is looked at.
     func discoverFriendIdentity(
         in assets: [PHAsset],
+        earlyCommit: EarlyCommitRule? = nil,
         onProgress: (@Sendable (Int, Int) -> Void)? = nil
     ) async -> IdentityDiscoveryResult {
         let model = mlModel
         let total = assets.count
 
-        // 3 loaders — VNImageRequestHandler.perform is a BLOCKING synchronous call, and
-        // these workers run on Swift's cooperative thread pool (~= CPU core count). Too
-        // many concurrent blocking workers can starve Vision's own internal work of a
-        // free thread and deadlock, so stay well under the core count.
-        var facesPerPhoto: [(photo: Int, faces: [(embedding: FaceEmbedding, box: CGRect)])] = []
+        // 3 loaders at a time. The blocking Vision/CoreML work runs on
+        // `visionQueue`, not the cooperative pool; 3 keeps memory and heat sane.
+        var facesPerPhoto: [PhotoFaces] = []
         var scanned = 0
+        var next = 0
+        var committed = false
         await withTaskGroup(of: (Int, [(embedding: FaceEmbedding, box: CGRect)]).self) { group in
-            var iterator = assets.enumerated().makeIterator()
             var pending = 0
-            while pending < 3, let (i, asset) = iterator.next() {
+            while pending < 3, next < assets.count {
+                let i = next, asset = assets[i]
                 group.addTask { (i, await Self.embedFacesInAsset(asset, model: model)) }
+                next += 1
                 pending += 1
             }
             for await (photo, faces) in group {
@@ -469,44 +491,88 @@ actor FaceMatchingService {
                 if !faces.isEmpty { facesPerPhoto.append((photo, faces)) }
                 scanned += 1
                 onProgress?(scanned, total)
-                if let (nextI, nextAsset) = iterator.next() {
-                    group.addTask { (nextI, await Self.embedFacesInAsset(nextAsset, model: model)) }
+                if let rule = earlyCommit, !committed, Self.shouldCommit(facesPerPhoto, rule: rule) {
+                    committed = true
+                    Self.logger.info("Identity discovery: committed early after \(scanned) of \(total) photos (\(next) started)")
+                }
+                if !committed, next < assets.count {
+                    let i = next, asset = assets[i]
+                    group.addTask { (i, await Self.embedFacesInAsset(asset, model: model)) }
+                    next += 1
                     pending += 1
                 }
             }
         }
+        let unprocessed = committed ? Array(assets[next...]) : []
 
-        // Group by person; rank groups by distinct photos.
-        let clusters = Self.group(facesPerPhoto.flatMap { photo, faces in faces.map { (embedding: $0.embedding, photo: photo) } },
-                                  threshold: Self.clusterThreshold)
-
-        guard let winner = clusters.max(by: {
-            ($0.photos.count, $0.members.count) < ($1.photos.count, $1.members.count)
-        }) else {
-            Self.logger.info("Identity discovery: no faces found in \(facesPerPhoto.count)/\(assets.count) photos")
-            return IdentityDiscoveryResult(identity: [], matches: [])
+        guard let (winner, _) = Self.rank(facesPerPhoto) else {
+            Self.logger.info("Identity discovery: no faces found in \(facesPerPhoto.count)/\(scanned) photos")
+            return IdentityDiscoveryResult(identity: [], matches: [], unprocessed: unprocessed)
         }
-        Self.logger.info("Identity discovery: \(clusters.count) identities across \(facesPerPhoto.count) photos; winner in \(winner.photos.count) photos (\(winner.members.count) faces)")
+        Self.logger.info("Identity discovery: winner in \(winner.photos.count) of \(facesPerPhoto.count) photos with faces (\(winner.members.count) faces); \(unprocessed.count) left for the scan")
 
-        // Build the per-photo match list: for each photo containing the winning
-        // identity, keep the winner's box and whether that photo has only one face.
+        return IdentityDiscoveryResult(identity: Array(winner.mostCentral.prefix(Self.identityLimit)),
+                                       matches: matches(for: winner, in: facesPerPhoto, assets: assets),
+                                       unprocessed: unprocessed)
+    }
+
+    /// Groups every face by person and ranks the groups by distinct photos,
+    /// ties by face count. Nil when there are no faces.
+    private nonisolated static func rank(_ facesPerPhoto: [PhotoFaces]) -> (winner: FaceGroup, runnerUp: FaceGroup?)? {
+        let clusters = group(facesPerPhoto.flatMap { photo, faces in faces.map { (embedding: $0.embedding, photo: photo) } },
+                             threshold: clusterThreshold)
+        let ranked = clusters.sorted {
+            ($0.photos.count, $0.members.count) > ($1.photos.count, $1.members.count)
+        }
+        guard let winner = ranked.first else { return nil }
+        return (winner, ranked.dropFirst().first)
+    }
+
+    /// The winner's face in a photo: the one most like the winner's mean, if
+    /// it clears the bar.
+    private nonisolated static func winnerFace(of winner: FaceGroup, in faces: [(embedding: FaceEmbedding, box: CGRect)]) -> CGRect? {
+        var bestBox: CGRect? = nil
+        var bestSim = clusterThreshold
+        for (embedding, box) in faces {
+            let sim = winner.mean.cosineSimilarity(to: embedding)
+            if sim >= bestSim {
+                bestSim = sim
+                bestBox = box
+            }
+        }
+        return bestBox
+    }
+
+    /// For each photo with the winner in it, the winner's box and whether the
+    /// photo has only one face.
+    private func matches(for winner: FaceGroup, in facesPerPhoto: [PhotoFaces], assets: [PHAsset]) -> [FriendPhotoMatch] {
         var matches: [FriendPhotoMatch] = []
         for (photo, faces) in facesPerPhoto {
-            guard winner.photos.contains(photo) else { continue }
-            var bestBox: CGRect? = nil
-            var bestSim = Self.clusterThreshold
-            for (embedding, box) in faces {
-                let sim = winner.mean.cosineSimilarity(to: embedding)
-                if sim >= bestSim {
-                    bestSim = sim
-                    bestBox = box
-                }
-            }
-            guard let box = bestBox else { continue }
+            guard winner.photos.contains(photo), let box = Self.winnerFace(of: winner, in: faces) else { continue }
             matches.append(FriendPhotoMatch(asset: assets[photo], faceBoundingBox: box, isSoloFace: faces.count == 1))
         }
+        return matches
+    }
 
-        return IdentityDiscoveryResult(identity: Array(winner.mostCentral.prefix(Self.identityLimit)), matches: matches)
+    /// Whether the photos seen so far already settle who the friend is.
+    private nonisolated static func shouldCommit(_ facesPerPhoto: [PhotoFaces], rule: EarlyCommitRule) -> Bool {
+        guard facesPerPhoto.count >= rule.minPhotosWithFaces,
+              let (winner, runnerUp) = rank(facesPerPhoto),
+              winner.photos.count >= rule.minPhotos,
+              Float(winner.photos.count) / Float(facesPerPhoto.count) >= rule.minCoverage,
+              winner.photos.count - (runnerUp?.photos.count ?? 0) >= rule.minLead else { return false }
+
+        var soloish = 0
+        for (photo, faces) in facesPerPhoto where winner.photos.contains(photo) {
+            if faces.count == 1 {
+                soloish += 1
+            } else if let box = winnerFace(of: winner, in: faces),
+                      faces.allSatisfy({ $0.box == box || box.width >= rule.soloWidthFactor * $0.box.width }) {
+                soloish += 1
+            }
+            if soloish >= rule.minSoloish { return true }
+        }
+        return false
     }
 
     private nonisolated static func embedFacesInAsset(

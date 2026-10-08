@@ -19,6 +19,9 @@ struct HomeView: View {
     @State private var showAccessAlert = false
     @State private var pickAlert: String? = nil
     @State private var titleLanded = false
+    /// "Multiple suspects": tapping a sticker checks it instead of playing.
+    @State private var selecting = false
+    @State private var selected: Set<UUID> = []
 
     // 6 = 2x3, 12 = 3x4, 20 = 4x5 — variants to try different grid shapes.
     private let cardCountOptions = [6, 12, 20]
@@ -58,6 +61,13 @@ struct HomeView: View {
                 }
                 .scrollBounceBehavior(.basedOnSize)
             }
+            .safeAreaInset(edge: .bottom) {
+                if selecting && !selectedFriends.isEmpty {
+                    dealBar
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: selecting && !selectedFriends.isEmpty)
 
             if let mode = tutorial {
                 AddFriendTutorialView(mode: mode) { exit in
@@ -72,6 +82,12 @@ struct HomeView: View {
             // Covers saved as JPEG lost their transparency; re-cut them once.
             Task { await CoverSticker.repairFlattenedCovers(savedFriends, context: modelContext) }
             appState.rescanner.ensureRunning()
+            if let ids = appState.resumeSelection {
+                // Back from "change the lineup": same friends, already checked.
+                appState.resumeSelection = nil
+                selected = Set(ids).intersection(savedFriends.map(\.id))
+                selecting = savedFriends.count >= 2 && !selected.isEmpty
+            }
             if appState.pendingAddFriend {
                 // Sent here from the demo result to add a real friend: let the
                 // screen land first, then carry on into the add flow.
@@ -144,7 +160,22 @@ struct HomeView: View {
 
     private var suspects: some View {
         VStack(spacing: 4) {
-            sectionLabel("YOUR SUSPECTS · TAP TO PLAY")
+            HStack(spacing: 0) {
+                sectionLabel(selecting ? "PICK YOUR SUSPECTS · \(selected.count) PICKED" : "YOUR SUSPECTS · TAP TO PLAY")
+                if selecting {
+                    Button {
+                        Haptics.press()
+                        resetSelection()
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(StickerCircleButtonStyle(diameter: 26))
+                    .padding(.trailing, 30)
+                    .accessibilityLabel("Stop picking suspects")
+                    .transition(.scale.combined(with: .opacity))
+                }
+            }
+            .frame(minHeight: 28)
 
             FriendCarouselView(
                 friends: savedFriends,
@@ -152,14 +183,68 @@ struct HomeView: View {
                 onHold: viewAlbum,
                 onEdit: editFriend,
                 onAddNew: requestAndPick,
-                onDemo: playDemo
+                onDemo: playDemo,
+                selection: selecting ? FriendSelection(selected: selected, onToggle: toggle) : nil
             )
 
-            Text("hold a sticker to peek at their album")
-                .font(.sticker(10.5, .medium))
-                .foregroundStyle(StickerTheme.ink.opacity(0.65))
-                .padding(.top, 2)
+            if savedFriends.count >= 2 && !selecting {
+                multipleSuspectsButton
+                    .padding(.top, 8)
+                    .transition(.scale(scale: 0.8).combined(with: .opacity))
+            }
         }
+        .animation(.spring(response: 0.3, dampingFraction: 0.75), value: selecting)
+    }
+
+    /// Enters select mode: pick several friends to mix into one deck.
+    private var multipleSuspectsButton: some View {
+        Button {
+            Haptics.press()
+            selected = []
+            selecting = true
+        } label: {
+            HStack(spacing: 8) {
+                MiniStickerFan(friends: Array(savedFriends.prefix(3)), size: 20, maxShown: 3)
+                Text("MULTIPLE SUSPECTS")
+            }
+        }
+        .buttonStyle(StickerButtonStyle(background: .white, foreground: StickerTheme.ink,
+                                        size: 12, cornerRadius: 999, fullWidth: false))
+        .rotationEffect(.degrees(-1.5))
+        .accessibilityLabel("Multiple suspects")
+        .accessibilityHint("Pick several friends to mix into one round")
+    }
+
+    private var selectedFriends: [Friend] {
+        savedFriends.filter { selected.contains($0.id) }
+    }
+
+    /// The checked friends, how the cards split between them, and the deal.
+    private var dealBar: some View {
+        HStack(spacing: 12) {
+            MiniStickerFan(friends: selectedFriends, size: 34, maxShown: 3)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(DealPlan.names(selectedFriends.map(\.displayName)))
+                    .font(.sticker(13, .heavy))
+                    .foregroundStyle(StickerTheme.ink)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Text(DealPlan.splitLine(cardCount: appState.cardCount, friendCount: selectedFriends.count))
+                    .font(.sticker(10.5, .medium))
+                    .foregroundStyle(StickerTheme.ink.opacity(0.7))
+                    .lineLimit(2)
+                    .contentTransition(.numericText())
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button("DEAL", action: dealRoster)
+                .buttonStyle(StickerButtonStyle(background: StickerTheme.flame, size: 15, fullWidth: false))
+        }
+        .padding(14)
+        .stickerCard(cornerRadius: 18)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 6)
     }
 
     /// No friends yet: the emoji pal stands in the line-up alone so there's still
@@ -214,6 +299,7 @@ struct HomeView: View {
                     .foregroundStyle(StickerTheme.ink.opacity(0.65))
                 Button("how?") {
                     Haptics.press()
+                    resetSelection()
                     tutorial = .replay
                 }
                 .font(.sticker(10.5, .black))
@@ -238,6 +324,8 @@ struct HomeView: View {
     private var autoScanToggle: some View {
         VStack(spacing: 8) {
             autoScanSwitch
+            #if DEBUG
+            // What the scan is up to; release builds just do it quietly.
             if autoScanIsOn, let status = appState.rescanner.statusLine {
                 Text(status)
                     .font(.sticker(10, .medium))
@@ -247,6 +335,7 @@ struct HomeView: View {
                     .contentTransition(.numericText())
                     .animation(.easeOut(duration: 0.2), value: status)
             }
+            #endif
         }
     }
 
@@ -322,6 +411,7 @@ struct HomeView: View {
 
     private func toggleAutoScan() {
         Haptics.flick()
+        resetSelection()
         if autoScanIsOn {
             withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { autoScan = false }
             appState.rescanner.stop()
@@ -344,23 +434,54 @@ struct HomeView: View {
         }
     }
 
+    private func toggle(_ friend: Friend) {
+        if selected.contains(friend.id) {
+            selected.remove(friend.id)
+        } else {
+            selected.insert(friend.id)
+        }
+    }
+
+    private func resetSelection() {
+        guard selecting || !selected.isEmpty else { return }
+        selected = []
+        selecting = false
+    }
+
+    /// Deals the checked friends into one round.
+    private func dealRoster() {
+        let roster = selectedFriends
+        guard !roster.isEmpty else { return }
+        Haptics.press()
+        appState.roster = roster
+        appState.usedPhotoIDs = []
+        appState.pendingPhotoIDs = []
+        resetSelection()
+        appState.rescanner.ensureRunning()
+        appState.screen = .processing
+    }
+
     private func playDemo() {
+        resetSelection()
         appState.startDemoRound()
     }
 
     private func play(_ friend: Friend) {
-        appState.currentFriend = friend
+        resetSelection()
+        appState.roster = [friend]
         appState.usedPhotoIDs = []
         appState.rescanner.ensureRunning()
         appState.screen = .processing
     }
 
     private func viewAlbum(_ friend: Friend) {
+        resetSelection()
         appState.viewingFriend = friend
         appState.screen = .album
     }
 
     private func editFriend(_ friend: Friend) {
+        resetSelection()
         appState.viewingFriend = friend
         appState.screen = .friendDetail
     }
@@ -368,6 +489,7 @@ struct HomeView: View {
     /// First time through, the tutorial comes before the system photo prompt so
     /// its last frame can explain what "all photos" is for before iOS asks.
     private func requestAndPick() {
+        resetSelection()
         if hasSeenTutorial {
             requestAccessThenPick()
         } else {
@@ -410,7 +532,8 @@ struct HomeView: View {
             return
         }
 
-        appState.currentFriend = nil
+        resetSelection()
+        appState.roster = []
         appState.pendingPhotoIDs = identifiers
         appState.usedPhotoIDs = []
         appState.screen = .processing

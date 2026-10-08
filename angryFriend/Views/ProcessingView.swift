@@ -17,32 +17,240 @@ struct ProcessingView: View {
     @State private var previews: [UIImage] = []
     /// Set by "Play with N now" to stop waiting on the rescan for more photos.
     @State private var playWithWhatWeHave = false
+    /// How many photos are being cut out for this round.
+    @State private var cardsToCut = 0
+
+    // New friend: named while the face is found, saved as soon as it's known.
+    /// Locked on appear, so leaving (which empties the roster) doesn't flip the layout mid-transition.
+    @State private var lockedNewFriendFlow: Bool? = nil
+    @State private var nameDraft = ""
+    @FocusState private var nameFocused: Bool
+    @State private var defaultName = "Friend"
+    @State private var committedFriend: Friend? = nil
+    @State private var discoveredMatches: [FriendPhotoMatch] = []
+    @State private var coverImage: UIImage? = nil
+    @State private var deckReady = false
+    @State private var showDiscardConfirm = false
 
     var body: some View {
-        ZStack {
+        ZStack(alignment: .topLeading) {
             // Background sheet and dots come from ContentView.
 
-            VStack(spacing: 0) {
-                Spacer()
-
-                if case .error(let message) = phase {
+            if case .error(let message) = phase {
+                VStack(spacing: 0) {
+                    Spacer()
                     errorState(message)
-                } else {
-                    workingState
+                    Spacer()
                 }
-
-                Spacer()
+                .padding(.horizontal, 30)
+            } else if isNewFriendFlow {
+                newFriendState
+            } else {
+                VStack(spacing: 0) {
+                    closeBar
+                    Spacer()
+                    workingState
+                    Spacer()
+                }
+                .padding(.horizontal, 30)
             }
-            .padding(.horizontal, 30)
         }
         .onAppear {
             Haptics.warmUp()
+            lockedNewFriendFlow = appState.roster.isEmpty
             start()
+            if appState.roster.isEmpty {
+                // Focusing mid-transition doesn't take; wait for the screen to land.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { nameFocused = true }
+            }
         }
-        .onDisappear { task?.cancel() }
+        // Once the friend is saved the task carries on to give them a sticker,
+        // even if they've already gone home or started playing.
+        .onDisappear { if committedFriend == nil { task?.cancel() } }
+        .onChange(of: nameDraft) { _, _ in
+            guard let friend = committedFriend else { return }
+            friend.name = storedName
+            try? modelContext.save()
+        }
+        .confirmationDialog(
+            "Discard \(buttonName)?",
+            isPresented: $showDiscardConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Discard", role: .destructive, action: discardFriend)
+            Button("Keep", role: .cancel) {}
+        } message: {
+            Text("They won't be saved. The photos stay in your library.")
+        }
     }
 
-    // MARK: - Working
+    // MARK: - New friend
+
+    private var isNewFriendFlow: Bool { lockedNewFriendFlow ?? appState.roster.isEmpty }
+    private var trimmedName: String { nameDraft.trimmingCharacters(in: .whitespacesAndNewlines) }
+    /// What the buttons call them: their name, or "Friend" until one is typed.
+    private var buttonName: String { trimmedName.isEmpty ? "Friend" : trimmedName }
+    /// What gets saved: their name, or "Friend N" when none was typed.
+    private var storedName: String { trimmedName.isEmpty ? defaultName : trimmedName }
+
+    private var newFriendState: some View {
+        VStack(spacing: 0) {
+            closeBar
+                .padding(.horizontal, 30)
+
+            ScrollView {
+                VStack(spacing: 0) {
+                    newFriendBadge
+                        .padding(.top, 18)
+
+                    StickerText(text: newFriendTitle, size: 22, fill: .white, strokeWidth: 1.6, drop: 2)
+                        .padding(.top, 22)
+
+                    Text(newFriendSubtitle)
+                        .font(.sticker(12.5, .medium))
+                        .foregroundStyle(StickerTheme.ink.opacity(0.75))
+                        .multilineTextAlignment(.center)
+                        .padding(.top, 8)
+
+                    Text("THEIR NAME")
+                        .font(.sticker(10.5, .black))
+                        .foregroundStyle(StickerTheme.ink.opacity(0.6))
+                        .padding(.top, 22)
+
+                    StickerNameField(text: $nameDraft, focused: $nameFocused, placeholder: "type a name")
+                        .padding(.top, 7)
+
+                    if committedFriend == nil {
+                        // Until the face is settled there's something to wait for.
+                        VStack(spacing: 12) {
+                            CandyProgressBar(progress: progressFraction, stripe: phaseColor)
+                                .frame(width: 214)
+                            Text(progressCaption)
+                                .font(.sticker(12, .bold))
+                                .foregroundStyle(StickerTheme.ink)
+                                .contentTransition(.numericText())
+                        }
+                        .padding(.top, 26)
+                        .transition(.opacity)
+                    } else {
+                        // After that, the cutouts landing are the only sign of work.
+                        previewStrip
+                            .frame(height: 46)
+                            .padding(.top, 26)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 30)
+                .padding(.bottom, 20)
+                .animation(.spring(response: 0.4, dampingFraction: 0.75), value: committedFriend != nil)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .scrollDismissesKeyboard(.interactively)
+
+            // Outside the scroll view, so the keyboard pushes them up instead of hiding them.
+            VStack(spacing: 12) {
+                Button(action: playNow) {
+                    Text("Play with Angry \(buttonName)")
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                }
+                .buttonStyle(StickerButtonStyle(background: StickerTheme.flame))
+                .disabled(!deckReady)
+                .opacity(deckReady ? 1 : 0.45)
+
+                Button(action: saveAndGoHome) {
+                    Text("Save \(buttonName)")
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                }
+                .buttonStyle(StickerButtonStyle(background: .white, foreground: StickerTheme.ink))
+                .disabled(committedFriend == nil)
+                .opacity(committedFriend == nil ? 0.45 : 1)
+            }
+            .padding(.horizontal, 30)
+            .padding(.top, 8)
+            .padding(.bottom, 14)
+            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: deckReady)
+        }
+    }
+
+    /// Before the face is known: today's working circle. Once it's known but
+    /// before the cover is cut: a dashed space for the sticker. Then the sticker.
+    private var newFriendBadge: some View {
+        ZStack {
+            if let coverImage {
+                Image(uiImage: coverImage)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 112, height: 112)
+                    .background(StickerTheme.tile(0))
+                    .clipShape(Circle())
+                    .overlay(Circle().stroke(.white, lineWidth: 4))
+                    .overlay(Circle().stroke(StickerTheme.ink, lineWidth: 2.5).padding(-4))
+                    .hardShadow(StickerTheme.ink.opacity(0.35), x: 4, y: 6)
+                    .rotationEffect(.degrees(-3))
+                    .transition(.scale(scale: 0.4).combined(with: .opacity))
+            } else {
+                ZStack {
+                    if committedFriend == nil {
+                        Circle()
+                            .fill(.white)
+                            .overlay(Circle().stroke(StickerTheme.ink, lineWidth: 3))
+                            .hardShadow(StickerTheme.ink.opacity(0.35), x: 5, y: 6)
+                    } else {
+                        Circle()
+                            .fill(Color.white.opacity(0.55))
+                            .overlay(
+                                Circle().strokeBorder(StickerTheme.ink.opacity(0.65),
+                                                      style: StrokeStyle(lineWidth: 2.5, dash: [7, 6]))
+                            )
+                    }
+                    Image(systemName: phaseIcon)
+                        .font(.system(size: 46, weight: .bold))
+                        .foregroundStyle(phaseColor)
+                        .contentTransition(.symbolEffect(.replace))
+                }
+                .frame(width: 112, height: 112)
+                .wiggling(true, amount: 6, speed: 0.85)
+            }
+        }
+        .animation(.spring(response: 0.45, dampingFraction: 0.6), value: coverImage != nil)
+    }
+
+    private var newFriendTitle: String {
+        if deckReady { return "ALL SET" }
+        return committedFriend == nil ? "WHO'S THAT?" : "SNIP SNIP"
+    }
+
+    private var newFriendSubtitle: String {
+        if deckReady { return "\(buttonName)'s deck is ready" }
+        if committedFriend == nil { return "spotting the face that keeps showing up" }
+        return "cutting \(buttonName) out of \(cardsToCut) photos"
+    }
+
+    // MARK: - Close
+
+    private var closeBar: some View {
+        HStack {
+            Button {
+                Haptics.press()
+                if committedFriend == nil {
+                    cancelToHome()
+                } else {
+                    showDiscardConfirm = true
+                }
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(StickerCircleButtonStyle(diameter: 32))
+            .accessibilityLabel(committedFriend == nil ? "Cancel" : "Discard \(buttonName)")
+
+            Spacer()
+        }
+        .padding(.top, 6)
+    }
+
+    // MARK: - Working (replays)
 
     private var workingState: some View {
         VStack(spacing: 0) {
@@ -53,10 +261,14 @@ struct ProcessingView: View {
                     .overlay(Circle().stroke(StickerTheme.ink, lineWidth: 3))
                     .hardShadow(StickerTheme.ink.opacity(0.35), x: 5, y: 6)
 
-                Image(systemName: phaseIcon)
-                    .font(.system(size: 46, weight: .bold))
-                    .foregroundStyle(phaseColor)
-                    .contentTransition(.symbolEffect(.replace))
+                if appState.roster.count > 1 {
+                    MiniStickerFan(friends: appState.roster, size: 40, maxShown: 3)
+                } else {
+                    Image(systemName: phaseIcon)
+                        .font(.system(size: 46, weight: .bold))
+                        .foregroundStyle(phaseColor)
+                        .contentTransition(.symbolEffect(.replace))
+                }
             }
             .wiggling(true, amount: 6, speed: 0.85)
 
@@ -68,7 +280,7 @@ struct ProcessingView: View {
                 .foregroundStyle(StickerTheme.ink.opacity(0.75))
                 .multilineTextAlignment(.center)
                 .padding(.top, 8)
-                .frame(height: 34)
+                .frame(minHeight: 34)
 
             CandyProgressBar(progress: progressFraction, stripe: phaseColor)
                 .frame(width: 214)
@@ -104,9 +316,7 @@ struct ProcessingView: View {
 
             Button("Go Back") {
                 Haptics.press()
-                task?.cancel()
-                appState.currentFriend = nil
-                appState.screen = .home
+                cancelToHome()
             }
             .buttonStyle(StickerButtonStyle(background: .white, foreground: StickerTheme.ink, size: 14, fullWidth: false))
         }
@@ -163,15 +373,73 @@ struct ProcessingView: View {
 
             Button("Go Back") {
                 Haptics.press()
-                task?.cancel()
-                appState.pendingPhotoIDs = []
-                appState.currentFriend = nil
-                appState.screen = .home
+                cancelToHome()
             }
             .buttonStyle(StickerButtonStyle(background: StickerTheme.blue))
             .padding(.top, 24)
         }
-        .onAppear { Haptics.warn() }
+        .onAppear {
+            nameFocused = false
+            Haptics.warn()
+        }
+    }
+
+    // MARK: - Leaving
+
+    /// Starts the game with the new friend's deck.
+    private func playNow() {
+        guard deckReady, let friend = committedFriend else { return }
+        Haptics.press()
+        nameFocused = false
+        friend.name = storedName
+        try? modelContext.save()
+        appState.roster = [friend]
+        appState.screen = .game
+    }
+
+    /// Keeps the new friend and goes home; the scan carries on with their album.
+    private func saveAndGoHome() {
+        guard let friend = committedFriend else { return }
+        Haptics.press()
+        nameFocused = false
+        friend.name = storedName
+        try? modelContext.save()
+        if !deckReady {
+            // Nobody's waiting for the deck any more: stop cutting, but still
+            // give them a sticker for the home screen.
+            task?.cancel()
+            let matches = discoveredMatches
+            Task {
+                guard friend.stickerData.isEmpty,
+                      let image = await Self.pickCoverImage(from: matches, alreadyExtracted: []) else { return }
+                Self.applyCover(image, to: friend)
+            }
+        }
+        appState.gameModel.reset()
+        appState.roster = []
+        appState.usedPhotoIDs = []
+        appState.screen = .home
+    }
+
+    /// Leaves without saving anything new.
+    private func cancelToHome() {
+        task?.cancel()
+        nameFocused = false
+        appState.gameModel.reset()
+        appState.pendingPhotoIDs = []
+        appState.roster = []
+        appState.screen = .home
+    }
+
+    /// The X after the friend was saved: deletes them again.
+    private func discardFriend() {
+        task?.cancel()
+        if let friend = committedFriend {
+            modelContext.delete(friend)
+            try? modelContext.save()
+        }
+        committedFriend = nil
+        cancelToHome()
     }
 
     // MARK: - Pipeline
@@ -179,20 +447,26 @@ struct ProcessingView: View {
     private func start() {
         // Every real round passes through here; the emoji demo never does.
         appState.isDemoRound = false
+        let roster = appState.roster
+        if roster.isEmpty {
+            defaultName = savedFriends.isEmpty ? "Friend" : "Friend \(savedFriends.count + 1)"
+        }
         task = Task {
-            if let friend = appState.currentFriend {
-                await runReplay(for: friend)
-            } else {
+            if roster.isEmpty {
                 await runNewFriend()
+            } else {
+                await runReplay(for: roster)
             }
         }
     }
 
-    /// New friend: discover who the recurring person is across ALL picked photos,
-    /// then extract cutouts for this round and save the friend's full album.
+    /// New friend: find who keeps showing up in the picks, stopping early once
+    /// that's clear, save them straight away (leftover picks go to the scan),
+    /// then cut out a deck and their cover sticker. Nothing starts the game:
+    /// that's the Play button.
     private func runNewFriend() async {
-        // Identifying and snipping get the phone to themselves; the background
-        // scan picks up again (including this friend) once the game starts.
+        // Identifying and snipping get the phone to themselves; the scan picks
+        // up again (starting with this friend's leftover picks) after.
         let rescanner = appState.rescanner
         rescanner.beginHold()
         defer { rescanner.endHold() }
@@ -216,8 +490,11 @@ struct ProcessingView: View {
             return
         }
 
-        let discovery = await service.discoverFriendIdentity(in: assets) { done, total in
-            Task { @MainActor in self.phase = .identifying(done, total) }
+        let needed = appState.cardCount
+        let discovery = await service.discoverFriendIdentity(in: assets, earlyCommit: EarlyCommitRule(minPhotos: needed)) { done, total in
+            Task { @MainActor in
+                if case .identifying = self.phase { self.phase = .identifying(done, total) }
+            }
         }
         guard Task.isCancelled == false else { return }
 
@@ -228,17 +505,41 @@ struct ProcessingView: View {
             return
         }
 
-        let needed = appState.cardCount
+        // The face is settled: save them now, so leaving from here on loses nothing.
+        let friend = Friend(
+            name: storedName,
+            stickerData: Data(),
+            photoMatches: discovery.matches.map { PhotoMatch(assetID: $0.asset.localIdentifier, faceBoundingBox: $0.faceBoundingBox) }
+        )
+        // What the background scan matches the rest of the library against.
+        friend.identity = discovery.identity
+        friend.pendingPickedIDs = discovery.unprocessed.map(\.localIdentifier)
+        modelContext.insert(friend)
+        try? modelContext.save()
+        committedFriend = friend
+        discoveredMatches = discovery.matches
+        appState.pendingPhotoIDs = []
+        rescanner.ensureRunning()
+        Haptics.done()
+
+        // Solo shots first, so a clean cover candidate is cut out early.
         let sampled = Array(discovery.matches.shuffled().prefix(needed))
+            .sorted { $0.isSoloFace && !$1.isSoloFace }
+        let soloIDs = Set(sampled.filter(\.isSoloFace).map(\.asset.localIdentifier))
         appState.usedPhotoIDs = Set(sampled.map { $0.asset.localIdentifier })
+        cardsToCut = sampled.count
 
         phase = .extracting(0, sampled.count)
-        let extracted = await Self.extractAll(sampled) { done, total, image in
+        let extracted = await Self.extractAll(sampled) { done, total, assetID, image in
             Task { @MainActor in
                 self.phase = .extracting(done, total)
-                if let image {
-                    self.previews.append(image)
-                    Haptics.tick()
+                guard let image else { return }
+                self.previews.append(image)
+                Haptics.tick()
+                if soloIDs.contains(assetID), let friend = self.committedFriend, friend.stickerData.isEmpty,
+                   FaceMatchingService.hasDetectableFace(in: image) {
+                    Self.applyCover(image, to: friend)
+                    self.coverImage = image
                 }
             }
         }
@@ -249,91 +550,129 @@ struct ProcessingView: View {
             return
         }
 
-        setupGame(from: extracted)
-
-        // Cover: prefer a photo with only the friend in it — a genuinely solo shot —
-        // so the friend's card in the carousel never shows anyone else. Verify each
-        // candidate cutout with the face model before committing to it, in case
-        // extraction produced a crop with no clearly detectable face.
-        let coverImage = await Self.pickCoverImage(from: discovery.matches, alreadyExtracted: extracted)
-
-        let name = savedFriends.isEmpty ? "Friend" : "Friend \(savedFriends.count + 1)"
-        let friend = Friend(
-            name: name,
-            stickerData: coverImage.flatMap(CoverSticker.encode) ?? Data(),
-            photoMatches: discovery.matches.map { PhotoMatch(assetID: $0.asset.localIdentifier, faceBoundingBox: $0.faceBoundingBox) }
-        )
-        // What the background scan matches the rest of the library against.
-        friend.identity = discovery.identity
-        modelContext.insert(friend)
-        try? modelContext.save()
-        rescanner.ensureRunning()
-        appState.currentFriend = friend
-        appState.pendingPhotoIDs = []
-
+        setupGame(from: extracted, friendOf: Dictionary(extracted.map { ($0.assetID, friend.id) }, uniquingKeysWith: { a, _ in a }))
+        deckReady = true
         Haptics.done()
-        appState.screen = .game
+
+        // No solo shot in the deck: pick a cover from everything that matched.
+        if friend.stickerData.isEmpty,
+           let image = await Self.pickCoverImage(from: discovery.matches, alreadyExtracted: extracted) {
+            Self.applyCover(image, to: friend)
+            coverImage = image
+        }
     }
 
-    /// Replay for an existing friend: resample from the already-known album — no
-    /// identity discovery needed, the face box for every photo is already stored.
-    private func runReplay(for friend: Friend) async {
-        let needed = appState.cardCount
+    /// Saves a cover sticker on a friend, unless they've been discarded meanwhile.
+    private static func applyCover(_ image: UIImage, to friend: Friend) {
+        guard !friend.isDeleted, let context = friend.modelContext,
+              let data = CoverSticker.encode(image) else { return }
+        friend.stickerData = data
+        try? context.save()
+    }
 
+    /// Replay for saved friends — one, or several mixed into one deck. Samples
+    /// from albums already known (every face box is stored), shared out by
+    /// `DealPlan`, waiting on the scan only if everyone together is short.
+    private func runReplay(for roster: [Friend]) async {
+        let needed = appState.cardCount
         let rescanner = appState.rescanner
+        let rosterIDs = Set(roster.map(\.id))
+        func albumTotal() -> Int { roster.reduce(0) { $0 + $1.photoMatches.count } }
 
         // Not enough photos for a full grid yet: give the scan a chance to find
-        // more before dealing — focused on this friend while we wait. Once there
-        // are enough the game starts and the scan carries on behind it.
-        if friend.photoMatches.count < needed {
-            rescanner.focusFriendID = friend.id
+        // more, focused on whoever is furthest short. Once there are enough the
+        // game starts and the scan carries on behind it.
+        defer {
+            if let id = rescanner.focusFriendID, rosterIDs.contains(id) { rescanner.focusFriendID = nil }
+        }
+        func focusShortest() {
+            let fairShare = (needed + roster.count - 1) / roster.count
+            let focus = roster.filter { rescanner.couldStillAdd(to: $0) || !rescanner.isRunning }
+                .max { fairShare - $0.photoMatches.count < fairShare - $1.photoMatches.count }
+            if rescanner.focusFriendID != focus?.id { rescanner.focusFriendID = focus?.id }
+        }
+        if albumTotal() < needed {
+            focusShortest()
             rescanner.ensureRunning()
         }
-        defer { if rescanner.focusFriendID == friend.id { rescanner.focusFriendID = nil } }
-        while friend.photoMatches.count < needed,
-              rescanner.couldStillAdd(to: friend),
+        while albumTotal() < needed,
+              roster.contains(where: { rescanner.couldStillAdd(to: $0) }),
               !playWithWhatWeHave {
-            phase = .findingPhotos(friend.photoMatches.count, needed)
+            focusShortest()
+            phase = .findingPhotos(albumTotal(), needed)
             try? await Task.sleep(for: .milliseconds(250))
             guard Task.isCancelled == false else { return }
         }
-        if rescanner.focusFriendID == friend.id { rescanner.focusFriendID = nil }
+        if let id = rescanner.focusFriendID, rosterIDs.contains(id) { rescanner.focusFriendID = nil }
 
         // Snipping gets the phone to itself; the scan waits within a photo.
         rescanner.beginHold()
         defer { rescanner.endHold() }
 
-        let available = friend.photoMatches.filter { !appState.usedPhotoIDs.contains($0.assetID) }
-        let source = available.count >= needed ? available : friend.photoMatches
-        let sampled = Array(source.shuffled().prefix(needed))
-
-        guard sampled.count >= 4 else {
-            phase = .error("This friend doesn't have enough photos saved to play.")
-            return
+        // Photos not used yet this session; when everyone together is out of
+        // those, start over from full albums.
+        var unused: [UUID: [PhotoMatch]] = [:]
+        for friend in roster {
+            unused[friend.id] = friend.photoMatches.filter { !appState.usedPhotoIDs.contains($0.assetID) }
+        }
+        if Set(unused.values.flatMap { $0.map(\.assetID) }).count < needed {
+            for friend in roster { unused[friend.id] = friend.photoMatches }
+            appState.usedPhotoIDs = []
         }
 
-        appState.usedPhotoIDs = available.count >= needed
-            ? appState.usedPhotoIDs.union(sampled.map(\.assetID))
-            : Set(sampled.map(\.assetID))
+        // Share the cards out, never dealing one photo twice (a group shot can
+        // be in two of these albums).
+        let shares = DealPlan.shares(cardCount: needed, available: unused.mapValues(\.count))
+        var taken: Set<String> = []
+        var picked: [(match: PhotoMatch, friendID: UUID)] = []
+        for friend in roster.shuffled() {
+            let want = shares[friend.id] ?? 0
+            var got = 0
+            for match in (unused[friend.id] ?? []).shuffled() where got < want && !taken.contains(match.assetID) {
+                taken.insert(match.assetID)
+                picked.append((match, friend.id))
+                got += 1
+            }
+        }
+        // Short because of shared photos: top up from anyone with spare.
+        if picked.count < needed {
+            for friend in roster.shuffled() {
+                for match in (unused[friend.id] ?? []).shuffled() where picked.count < needed && !taken.contains(match.assetID) {
+                    taken.insert(match.assetID)
+                    picked.append((match, friend.id))
+                }
+            }
+        }
 
-        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: sampled.map(\.assetID), options: nil)
+        guard picked.count >= 4 else {
+            phase = .error(roster.count > 1
+                ? "These friends don't have enough photos saved to play."
+                : "This friend doesn't have enough photos saved to play.")
+            return
+        }
+        appState.usedPhotoIDs.formUnion(taken)
+
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: picked.map(\.match.assetID), options: nil)
         var assetsByID: [String: PHAsset] = [:]
         fetched.enumerateObjects { asset, _, _ in assetsByID[asset.localIdentifier] = asset }
 
-        let pairs: [FriendPhotoMatch] = sampled.compactMap { match in
-            guard let asset = assetsByID[match.assetID] else { return nil }
-            return FriendPhotoMatch(asset: asset, faceBoundingBox: match.faceBoundingBox, isSoloFace: false)
+        var friendOf: [String: UUID] = [:]
+        let pairs: [FriendPhotoMatch] = picked.compactMap { entry in
+            guard let asset = assetsByID[entry.match.assetID] else { return nil }
+            friendOf[entry.match.assetID] = entry.friendID
+            return FriendPhotoMatch(asset: asset, faceBoundingBox: entry.match.faceBoundingBox, isSoloFace: false)
         }
 
         guard pairs.count >= 4 else {
-            phase = .error("Some of this friend's photos are missing from your library. Try picking new photos.")
+            phase = .error("Some of these photos are missing from your library. Try picking new photos.")
             return
         }
 
+        cardsToCut = pairs.count
         phase = .extracting(0, pairs.count)
         let started = Date()
-        defer { logger.info("Cut out \(pairs.count) photos in \(String(format: "%.1f", Date().timeIntervalSince(started)))s") }
-        let extracted = await Self.extractAll(pairs) { done, total, image in
+        defer { logger.info("Cut out \(pairs.count) photos for \(roster.count) friend(s) in \(String(format: "%.1f", Date().timeIntervalSince(started)))s") }
+        let extracted = await Self.extractAll(pairs) { done, total, _, image in
             Task { @MainActor in
                 self.phase = .extracting(done, total)
                 if let image {
@@ -349,28 +688,29 @@ struct ProcessingView: View {
             return
         }
 
-        setupGame(from: extracted)
+        setupGame(from: extracted, friendOf: friendOf)
         Haptics.done()
         appState.screen = .game
     }
 
     // MARK: - Game setup
 
-    private func setupGame(from extracted: [(assetID: String, image: UIImage)]) {
+    /// Exactly one angry card, whoever's face it is.
+    private func setupGame(from extracted: [(assetID: String, image: UIImage)], friendOf: [String: UUID]) {
         let angryIndex = Int.random(in: 0..<extracted.count)
         let cards = extracted.enumerated().map { i, entry in
-            GameCard(image: entry.image, isAngry: i == angryIndex)
+            GameCard(image: entry.image, isAngry: i == angryIndex, friendID: friendOf[entry.assetID])
         }
         appState.gameModel.setup(from: cards.shuffled())
     }
 
     // MARK: - Concurrent extraction
 
-    /// `onProgress` also hands back each finished cutout so the UI can show the
-    /// pile growing — it's the same work, just reported as it lands.
+    /// `onProgress` also hands back each finished cutout (and its photo) so the
+    /// UI can show the pile growing — it's the same work, just reported as it lands.
     private static func extractAll(
         _ matches: [FriendPhotoMatch],
-        onProgress: @escaping @Sendable (Int, Int, UIImage?) -> Void
+        onProgress: @escaping @Sendable (Int, Int, String, UIImage?) -> Void
     ) async -> [(assetID: String, image: UIImage)] {
         await withTaskGroup(of: (Int, String, UIImage?).self, returning: [(assetID: String, image: UIImage)].self) { group in
             var results: [(Int, String, UIImage)] = []
@@ -385,7 +725,7 @@ struct ProcessingView: View {
             for await (i, assetID, image) in group {
                 pending -= 1
                 if let image { results.append((i, assetID, image)) }
-                onProgress(results.count, matches.count, image)
+                onProgress(results.count, matches.count, assetID, image)
                 if let (nextI, nextMatch) = iterator.next() {
                     group.addTask { (nextI, nextMatch.asset.localIdentifier, await loadAndExtract(asset: nextMatch.asset, box: nextMatch.faceBoundingBox)) }
                     pending += 1
@@ -431,8 +771,8 @@ struct ProcessingView: View {
     // MARK: - Phase helpers
 
     private var friendLabel: String {
-        let name = appState.currentFriend?.name ?? ""
-        return name.isEmpty ? "your friend" : name
+        let names = appState.roster.map(\.displayName)
+        return names.isEmpty ? "your friend" : DealPlan.names(names)
     }
 
     private var progressFraction: Double {
@@ -486,7 +826,7 @@ struct ProcessingView: View {
         switch phase {
         case .idle: return "shuffling the deck…"
         case .identifying: return "spotting the face that keeps showing up"
-        case .extracting: return "cutting \(friendLabel) out of every photo"
+        case .extracting: return "cutting \(friendLabel) out of \(cardsToCut) photos"
         case .findingPhotos: return "finding photos of \(friendLabel)…"
         case .error(let msg): return msg
         }

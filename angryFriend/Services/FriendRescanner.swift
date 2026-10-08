@@ -70,6 +70,7 @@ final class FriendRescanner {
         case idle
         case newPhotos
         case catchingUp(String)   // a friend's name
+        case addingPicks(String)  // a new friend's picks that discovery stopped before reaching
         case tidying(String)      // re-checking a friend's album after the matching rules changed
         case walking
         case cloud
@@ -91,6 +92,7 @@ final class FriendRescanner {
     // For the home screen's status line; refreshed every round.
     private(set) var walkRemaining = 0
     private(set) var catchUpRemaining = 0
+    private(set) var picksRemaining = 0
     private(set) var cloudWaiting = 0
     private(set) var isOffline = false
 
@@ -183,7 +185,7 @@ final class FriendRescanner {
         let control = ScanControl()
         control.setHeld(holdCount > 0)
         self.control = control
-        runPriority = focusFriendID == nil ? .utility : .userInitiated
+        runPriority = wantedPriority
         restartForPriority = false
         checkedThisRun = 0
         if backgroundRun == nil, UIApplication.shared.applicationState == .background { beginBackgroundTask() }
@@ -234,8 +236,7 @@ final class FriendRescanner {
         Self.logger.info("Scan started (\(self.runPriority == .userInitiated ? "focused" : "background")): new photos after \(state.newestModifiedSeen), walk \(state.walkDone ? "done" : "at \(state.walkCursor)"), \(state.pendingCloudIDs.count) waiting for iCloud")
 
         while isCurrent(gen, control) {
-            let wanted: TaskPriority = focusFriendID == nil ? .utility : .userInitiated
-            if wanted != runPriority {
+            if wantedPriority != runPriority {
                 restartForPriority = true
                 return
             }
@@ -253,7 +254,15 @@ final class FriendRescanner {
             case .nothingLeft: break
             }
 
-            // 2. Two turns for whoever is furthest behind, one for the shared walk.
+            // 2. A new friend's own picks that discovery didn't get to: the album
+            // the user just made fills before anything older is looked at.
+            switch await pickedStep(round, state: state, service: service, generation: gen, control: control) {
+            case .stopped: return
+            case .worked: worked = true
+            case .nothingLeft: break
+            }
+
+            // 3. Two turns for whoever is furthest behind, one for the shared walk.
             // Picked once per round: counting what each friend has left is a
             // library query, and this runs on the main actor.
             let lagging = laggingFriend(round)
@@ -275,7 +284,7 @@ final class FriendRescanner {
                 if result == .worked { worked = true }
             }
 
-            // 3. A few iCloud downloads.
+            // 4. A few iCloud downloads.
             switch await cloudStep(round, state: state, service: service, generation: gen, control: control) {
             case .stopped: return
             case .worked: worked = true
@@ -302,7 +311,7 @@ final class FriendRescanner {
             save()
             return false
         }
-        return friends.contains { $0.catchUpFloor == nil || $0.needsCatchUp || $0.identityVersion < Friend.currentIdentityVersion || $0.needsNotThemRecheck }
+        return friends.contains { $0.catchUpFloor == nil || $0.needsCatchUp || $0.hasPendingPicks || $0.identityVersion < Friend.currentIdentityVersion || $0.needsNotThemRecheck }
             || !state.walkDone
             || (!state.pendingCloudIDs.isEmpty && NetworkMonitor.shared.isOnline)
             || library.count(changedAfter: state.newestModifiedSeen) > 0
@@ -515,6 +524,36 @@ final class FriendRescanner {
         return .worked
     }
 
+    /// Every friend's leftover picks, oldest friend first, in chunks. Checked
+    /// against everyone, so one face still goes to one person; photos already
+    /// in the album are skipped and iCloud-only picks join the iCloud queue.
+    private func pickedStep(_ round: Round, state: ScanState, service: FaceMatchingService, generation gen: Int, control: ScanControl) async -> StepResult {
+        let waiting = round.friends.values
+            .filter { Self.isAlive($0) && $0.hasPendingPicks }
+            .sorted { $0.createdAt < $1.createdAt }
+        guard !waiting.isEmpty else { return .nothingLeft }
+        for friend in waiting {
+            while Self.isAlive(friend), friend.hasPendingPicks {
+                guard isCurrent(gen, control) else { return .stopped }
+                phase = .addingPicks(friend.name)
+                picksRemaining = friend.pendingPickedIDs.count
+                let batch = Array(friend.pendingPickedIDs.prefix(Self.chunkSize))
+                let assets = Self.assets(withIDs: batch)   // a pick deleted since just drops out
+                Self.logger.debug("Picks \(friend.name): \(batch.count) of \(friend.pendingPickedIDs.count)")
+                guard await check(batch.compactMap { assets[$0] }, for: [friend.id], round: round, state: state,
+                                  service: service, generation: gen, control: control) else { return .stopped }
+                guard Self.isAlive(friend) else { break }
+                friend.pendingPickedIDs.removeFirst(min(batch.count, friend.pendingPickedIDs.count))
+                picksRemaining = friend.pendingPickedIDs.count
+                save()
+                if !friend.hasPendingPicks {
+                    Self.logger.info("\(friend.name)'s picks all checked; album has \(friend.photoMatches.count)")
+                }
+            }
+        }
+        return .worked
+    }
+
     /// One chunk of a friend's own walk back through what the shared walk had
     /// already passed when they joined.
     private func catchUpStep(_ friend: Friend, round: Round, state: ScanState, service: FaceMatchingService, generation gen: Int, control: ScanControl) async -> StepResult {
@@ -662,6 +701,15 @@ final class FriendRescanner {
             catchUpRemaining = friends.filter(\.needsCatchUp).reduce(0) { $0 + remaining($1) }
         }
         cloudWaiting = state.pendingCloudIDs.count
+        picksRemaining = friends.filter(Self.isAlive).reduce(0) { $0 + $1.pendingPickedIDs.count }
+    }
+
+    /// User-initiated while someone's waiting on the processing screen, or while
+    /// a new friend's picks are still being added; utility otherwise.
+    private var wantedPriority: TaskPriority {
+        if focusFriendID != nil { return .userInitiated }
+        let friends = (try? context.fetch(FetchDescriptor<Friend>())) ?? []
+        return friends.contains { Self.isAlive($0) && $0.hasPendingPicks } ? .userInitiated : .utility
     }
 
     /// One line for the home screen, or nil when there's nothing to say.
@@ -675,6 +723,7 @@ final class FriendRescanner {
             case .idle: return nil
             case .newPhotos: parts.append("checking new photos")
             case .catchingUp(let name): parts.append("catching up \(name) · \(catchUpRemaining.formatted()) left")
+            case .addingPicks(let name): parts.append("adding \(name)'s picks · \(picksRemaining.formatted()) left")
             case .tidying(let name): parts.append("tidying \(name)'s album")
             case .walking: parts.append("checking older photos · \(walkRemaining.formatted()) left")
             case .cloud: parts.append("downloading from iCloud")

@@ -39,6 +39,7 @@ final class Friend {
     var catchUpBefore: Date? = nil          // own walk back through photos the shared walk passed before this friend joined
     var catchUpFloor: Date? = nil           // ...down to here, where the shared walk was; nil → not joined the scan yet
     var excludedIDs: [String] = [String]()  // removed from the album on purpose — a rescan must never add them back
+    var pendingPickedIDs: [String] = [String]()  // picked photos discovery stopped before reaching; the scan checks them first
 
     init(name: String, stickerData: Data, photoMatches: [PhotoMatch]) {
         self.id = UUID()
@@ -66,6 +67,9 @@ extension Friend {
     /// Matching template: the mean of the stored faces, plus the "Not them"
     /// faces. Nil until there are faces.
     var template: FaceTemplate? { FaceTemplate(faces: identity, negatives: negatives) }
+
+    /// Picked photos still waiting for the scan (discovery committed early).
+    var hasPendingPicks: Bool { !pendingPickedIDs.isEmpty }
 
     /// New "Not them" faces since the album was last re-checked against them.
     var needsNotThemRecheck: Bool { notThemChecked != negatives.count }

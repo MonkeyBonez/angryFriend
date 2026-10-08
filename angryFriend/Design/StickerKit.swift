@@ -519,3 +519,37 @@ struct StickerTopBar<Trailing: View>: View {
         .padding(.vertical, 8)
     }
 }
+
+// MARK: - Name field
+
+/// The friend-name field: a slightly tilted white label that turns pink while
+/// typing. Shared by the new-friend screen and the friend detail screen.
+struct StickerNameField: View {
+    @Binding var text: String
+    var focused: FocusState<Bool>.Binding
+    var placeholder: String = "Friend's name"
+
+    var body: some View {
+        TextField(placeholder, text: $text)
+            .font(.sticker(20, .black))
+            .foregroundStyle(StickerTheme.ink)
+            .multilineTextAlignment(.center)
+            .textFieldStyle(.plain)
+            .focused(focused)
+            .submitLabel(.done)
+            .onSubmit { focused.wrappedValue = false }
+            .autocorrectionDisabled()
+            .textInputAutocapitalization(.words)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .frame(maxWidth: 250)
+            .background(.white, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(focused.wrappedValue ? StickerTheme.pink : StickerTheme.ink, lineWidth: 2.5)
+            )
+            .hardShadow(StickerTheme.ink, x: 2.5, y: 2.5)
+            .rotationEffect(.degrees(-1))
+            .animation(.spring(response: 0.25, dampingFraction: 0.7), value: focused.wrappedValue)
+    }
+}

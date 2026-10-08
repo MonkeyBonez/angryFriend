@@ -6,6 +6,7 @@ struct GameCard: Identifiable {
     let id = UUID()
     let image: UIImage
     var isAngry: Bool
+    var friendID: UUID? = nil   // whose face this card is; nil for the emoji demo
     var isTapped = false
 }
 

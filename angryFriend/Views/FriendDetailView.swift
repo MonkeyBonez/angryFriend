@@ -129,25 +129,7 @@ private struct FriendDetailContent: View {
                 .font(.sticker(10.5, .black))
                 .foregroundStyle(StickerTheme.ink.opacity(0.6))
 
-            TextField("Friend's name", text: $friend.name)
-                .font(.sticker(20, .black))
-                .foregroundStyle(StickerTheme.ink)
-                .multilineTextAlignment(.center)
-                .textFieldStyle(.plain)
-                .focused($nameFocused)
-                .submitLabel(.done)
-                .onSubmit { nameFocused = false }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 10)
-                .frame(maxWidth: 250)
-                .background(.white, in: RoundedRectangle(cornerRadius: 8))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(nameFocused ? StickerTheme.pink : StickerTheme.ink, lineWidth: 2.5)
-                )
-                .hardShadow(StickerTheme.ink, x: 2.5, y: 2.5)
-                .rotationEffect(.degrees(-1))
-                .animation(.spring(response: 0.25, dampingFraction: 0.7), value: nameFocused)
+            StickerNameField(text: $friend.name, focused: $nameFocused)
                 .onChange(of: friend.name) { _, _ in
                     try? modelContext.save()
                 }
@@ -192,7 +174,7 @@ private struct FriendDetailContent: View {
 
     private func play() {
         Haptics.press()
-        appState.currentFriend = friend
+        appState.roster = [friend]
         appState.usedPhotoIDs = []
         appState.viewingFriend = nil
         appState.isPickingCoverPhoto = false
@@ -213,9 +195,7 @@ private struct FriendDetailContent: View {
     }
 
     private func deleteFriend() {
-        if appState.currentFriend?.id == friend.id {
-            appState.currentFriend = nil
-        }
+        appState.roster.removeAll { $0.id == friend.id }
         modelContext.delete(friend)
         try? modelContext.save()
         appState.viewingFriend = nil

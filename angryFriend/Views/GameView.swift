@@ -41,6 +41,12 @@ struct GameView: View {
                 }
                 .padding(.top, 10)
 
+                // Several friends in one deck: show who's in it.
+                if appState.roster.count > 1 {
+                    RosterRow(friends: appState.roster)
+                        .padding(.top, 8)
+                }
+
                 Spacer(minLength: 8)
 
                 LazyVGrid(columns: columns, spacing: spacing) {
@@ -120,7 +126,7 @@ struct GameView: View {
         appState.gameModel.reset()
         appState.pendingPhotoIDs = []
         appState.usedPhotoIDs = []
-        appState.currentFriend = nil
+        appState.roster = []
         appState.isDemoRound = false
         appState.screen = .home
     }
