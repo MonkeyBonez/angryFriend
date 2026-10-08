@@ -176,10 +176,9 @@ struct HomeView: View {
     }
 
     /// The MULTIPLE SUSPECTS toggle (filled while on), with DEAL beside it once
-    /// someone's picked and the split underneath.
+    /// someone's picked.
     private var multipleSuspectsRow: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 10) {
+        HStack(spacing: 10) {
                 Button {
                     Haptics.flick()
                     if selecting {
@@ -207,15 +206,6 @@ struct HomeView: View {
                         .buttonStyle(StickerButtonStyle(background: StickerTheme.flame, size: 13, cornerRadius: 999, fullWidth: false))
                         .transition(.scale(scale: 0.6).combined(with: .opacity))
                 }
-            }
-
-            if selecting && !selectedFriends.isEmpty {
-                Text(DealPlan.splitLine(cardCount: appState.cardCount, friendCount: selectedFriends.count))
-                    .font(.sticker(10.5, .medium))
-                    .foregroundStyle(StickerTheme.ink.opacity(0.7))
-                    .contentTransition(.numericText())
-                    .transition(.opacity)
-            }
         }
     }
 
