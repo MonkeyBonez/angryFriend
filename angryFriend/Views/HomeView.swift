@@ -61,13 +61,6 @@ struct HomeView: View {
                 }
                 .scrollBounceBehavior(.basedOnSize)
             }
-            .safeAreaInset(edge: .bottom) {
-                if selecting && !selectedFriends.isEmpty {
-                    dealBar
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-            }
-            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: selecting && !selectedFriends.isEmpty)
 
             if let mode = tutorial {
                 AddFriendTutorialView(mode: mode) { exit in
@@ -160,22 +153,8 @@ struct HomeView: View {
 
     private var suspects: some View {
         VStack(spacing: 4) {
-            HStack(spacing: 0) {
-                sectionLabel(selecting ? "PICK YOUR SUSPECTS · \(selected.count) PICKED" : "YOUR SUSPECTS · TAP TO PLAY")
-                if selecting {
-                    Button {
-                        Haptics.press()
-                        resetSelection()
-                    } label: {
-                        Image(systemName: "xmark")
-                    }
-                    .buttonStyle(StickerCircleButtonStyle(diameter: 26))
-                    .padding(.trailing, 30)
-                    .accessibilityLabel("Stop picking suspects")
-                    .transition(.scale.combined(with: .opacity))
-                }
-            }
-            .frame(minHeight: 28)
+            sectionLabel(selecting ? "PICK YOUR SUSPECTS · \(selected.count) PICKED" : "YOUR SUSPECTS · TAP TO PLAY")
+                .contentTransition(.numericText())
 
             FriendCarouselView(
                 friends: savedFriends,
@@ -187,64 +166,61 @@ struct HomeView: View {
                 selection: selecting ? FriendSelection(selected: selected, onToggle: toggle) : nil
             )
 
-            if savedFriends.count >= 2 && !selecting {
-                multipleSuspectsButton
+            if savedFriends.count >= 2 {
+                multipleSuspectsRow
                     .padding(.top, 8)
-                    .transition(.scale(scale: 0.8).combined(with: .opacity))
             }
         }
         .animation(.spring(response: 0.3, dampingFraction: 0.75), value: selecting)
+        .animation(.spring(response: 0.3, dampingFraction: 0.75), value: selected.isEmpty)
     }
 
-    /// Enters select mode: pick several friends to mix into one deck.
-    private var multipleSuspectsButton: some View {
-        Button {
-            Haptics.press()
-            selected = []
-            selecting = true
-        } label: {
-            HStack(spacing: 8) {
-                MiniStickerFan(friends: Array(savedFriends.prefix(3)), size: 20, maxShown: 3)
-                Text("MULTIPLE SUSPECTS")
+    /// The MULTIPLE SUSPECTS toggle (filled while on), with DEAL beside it once
+    /// someone's picked and the split underneath.
+    private var multipleSuspectsRow: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 10) {
+                Button {
+                    Haptics.flick()
+                    if selecting {
+                        resetSelection()
+                    } else {
+                        selected = []
+                        selecting = true
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        MiniStickerFan(friends: Array(savedFriends.prefix(3)), size: 20, maxShown: 3)
+                        Text("MULTIPLE SUSPECTS")
+                    }
+                }
+                .buttonStyle(StickerButtonStyle(background: selecting ? StickerTheme.ink : .white,
+                                                foreground: selecting ? .white : StickerTheme.ink,
+                                                size: 12, cornerRadius: 999, fullWidth: false))
+                .rotationEffect(.degrees(selecting ? 1.5 : -1.5))
+                .accessibilityLabel("Multiple suspects")
+                .accessibilityValue(selecting ? "On" : "Off")
+                .accessibilityHint("Pick several friends to mix into one round")
+
+                if selecting && !selectedFriends.isEmpty {
+                    Button("DEAL", action: dealRoster)
+                        .buttonStyle(StickerButtonStyle(background: StickerTheme.flame, size: 13, cornerRadius: 999, fullWidth: false))
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
+                }
+            }
+
+            if selecting && !selectedFriends.isEmpty {
+                Text(DealPlan.splitLine(cardCount: appState.cardCount, friendCount: selectedFriends.count))
+                    .font(.sticker(10.5, .medium))
+                    .foregroundStyle(StickerTheme.ink.opacity(0.7))
+                    .contentTransition(.numericText())
+                    .transition(.opacity)
             }
         }
-        .buttonStyle(StickerButtonStyle(background: .white, foreground: StickerTheme.ink,
-                                        size: 12, cornerRadius: 999, fullWidth: false))
-        .rotationEffect(.degrees(-1.5))
-        .accessibilityLabel("Multiple suspects")
-        .accessibilityHint("Pick several friends to mix into one round")
     }
 
     private var selectedFriends: [Friend] {
         savedFriends.filter { selected.contains($0.id) }
-    }
-
-    /// The checked friends, how the cards split between them, and the deal.
-    private var dealBar: some View {
-        HStack(spacing: 12) {
-            MiniStickerFan(friends: selectedFriends, size: 34, maxShown: 3)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(DealPlan.names(selectedFriends.map(\.displayName)))
-                    .font(.sticker(13, .heavy))
-                    .foregroundStyle(StickerTheme.ink)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Text(DealPlan.splitLine(cardCount: appState.cardCount, friendCount: selectedFriends.count))
-                    .font(.sticker(10.5, .medium))
-                    .foregroundStyle(StickerTheme.ink.opacity(0.7))
-                    .lineLimit(2)
-                    .contentTransition(.numericText())
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            Button("DEAL", action: dealRoster)
-                .buttonStyle(StickerButtonStyle(background: StickerTheme.flame, size: 15, fullWidth: false))
-        }
-        .padding(14)
-        .stickerCard(cornerRadius: 18)
-        .padding(.horizontal, 16)
-        .padding(.bottom, 6)
     }
 
     /// No friends yet: the emoji pal stands in the line-up alone so there's still
