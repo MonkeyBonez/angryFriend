@@ -22,16 +22,24 @@ struct FriendCarouselView: View {
     var selection: FriendSelection? = nil
     var onReorder: ([Friend]) -> Void = { _ in }
 
+    /// The sticker being held, and how far it's been dragged. Gesture state, so
+    /// it clears itself the moment the finger lifts or the system cancels the
+    /// gesture — nothing can stay "held".
+    private struct Lift: Equatable {
+        var id: UUID
+        var translation: CGFloat
+    }
+    @GestureState private var lift: Lift? = nil
     /// The order on screen while a sticker is being dragged; follows `friends` otherwise.
     @State private var dragOrder: [Friend] = []
-    @State private var dragging: UUID? = nil
     @State private var dragStartIndex = 0
-    @State private var dragTranslation: CGFloat = 0
 
     /// One sticker's width plus the row's spacing: how far a drag moves one place.
     private let pitch: CGFloat = 86 + 16
 
-    private var shown: [Friend] { dragging == nil ? friends : dragOrder }
+    private var dragging: UUID? { lift?.id }
+    private var dragTranslation: CGFloat { lift?.translation ?? 0 }
+    private var shown: [Friend] { dragging == nil || dragOrder.count != friends.count ? friends : dragOrder }
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -56,7 +64,8 @@ struct FriendCarouselView: View {
                     .offset(x: lifted ? dragTranslation - CGFloat(index - dragStartIndex) * pitch : 0)
                     .zIndex(lifted ? 10 : 0)
                     .animation(lifted ? nil : .spring(response: 0.3, dampingFraction: 0.75), value: index)
-                    .highPriorityGesture(reorderGesture(for: friend), including: selection == nil ? .all : .subviews)
+                    .animation(.spring(response: 0.3, dampingFraction: 0.7), value: dragging == nil)
+                    .gesture(reorderGesture(for: friend), including: selection == nil ? .all : .subviews)
                     .popIn(delay: 0.1 + Double(index) * 0.06)
                 }
 
@@ -73,25 +82,38 @@ struct FriendCarouselView: View {
             .padding(.vertical, 10)
         }
         .scrollClipDisabled()
-        .scrollDisabled(dragging != nil)
+        .onChange(of: lift == nil) { _, released in
+            // Dropped (or cancelled): keep whatever order was on screen.
+            guard released, dragOrder.count == friends.count, dragOrder.map(\.id) != friends.map(\.id) else { return }
+            Haptics.done()
+            onReorder(dragOrder)
+        }
     }
 
-    /// Hold to lift, then drag along the row. Dropping saves the new order.
+    /// Hold to lift, then drag along the row. The lift lives in gesture state,
+    /// so letting go always puts the sticker down.
     private func reorderGesture(for friend: Friend) -> some Gesture {
         LongPressGesture(minimumDuration: 0.35)
             .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .local))
+            .updating($lift) { value, lift, _ in
+                switch value {
+                case .first(true):
+                    if lift == nil, friends.count > 1 { lift = Lift(id: friend.id, translation: 0) }
+                case .second(true, let drag?):
+                    if lift?.id == friend.id { lift?.translation = drag.translation.width }
+                default:
+                    break
+                }
+            }
             .onChanged { value in
                 switch value {
                 case .first(true):
-                    guard dragging == nil, friends.count > 1 else { return }
+                    guard friends.count > 1 else { return }
                     Haptics.press()
                     dragOrder = friends
                     dragStartIndex = friends.firstIndex { $0.id == friend.id } ?? 0
-                    dragTranslation = 0
-                    withAnimation(.spring(response: 0.25, dampingFraction: 0.6)) { dragging = friend.id }
                 case .second(true, let drag?):
-                    guard dragging == friend.id else { return }
-                    dragTranslation = drag.translation.width
+                    guard dragging == friend.id, !dragOrder.isEmpty else { return }
                     let wanted = max(0, min(dragOrder.count - 1, dragStartIndex + Int((drag.translation.width / pitch).rounded())))
                     if let current = dragOrder.firstIndex(where: { $0.id == friend.id }), current != wanted {
                         Haptics.flick()
@@ -101,18 +123,6 @@ struct FriendCarouselView: View {
                     }
                 default:
                     break
-                }
-            }
-            .onEnded { _ in
-                guard dragging == friend.id else { return }
-                let order = dragOrder
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                    dragTranslation = 0
-                    dragging = nil
-                }
-                if order.map(\.id) != friends.map(\.id) {
-                    Haptics.done()
-                    onReorder(order)
                 }
             }
     }
