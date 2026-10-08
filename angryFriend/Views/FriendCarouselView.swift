@@ -41,6 +41,15 @@ struct FriendCarouselView: View {
     private var dragging: UUID? { lift?.id }
     private var dragTranslation: CGFloat { lift?.translation ?? 0 }
 
+    /// Each friend's colour and lean for this launch: taken from their slot the
+    /// first time they're seen, then kept, so moving them never repaints anyone.
+    @MainActor private static var looks: [UUID: Int] = [:]
+    private func look(for friend: Friend, at index: Int) -> Int {
+        if let look = Self.looks[friend.id] { return look }
+        Self.looks[friend.id] = index
+        return index
+    }
+
     /// The slot the held sticker is hovering over.
     private var dropIndex: Int {
         max(0, min(friends.count - 1, dragStartIndex + Int((dragTranslation / pitch).rounded())))
@@ -71,7 +80,8 @@ struct FriendCarouselView: View {
                         selecting: selection != nil,
                         isSelected: selection?.selected.contains(friend.id) ?? false,
                         onToggle: { selection?.onToggle(friend) },
-                        lifted: lifted
+                        lifted: lifted,
+                        look: look(for: friend, at: index)
                     )
                     // The lifted sticker follows the finger; the others step aside
                     // to show where it will land. The real order changes on drop.
@@ -156,6 +166,8 @@ private struct FriendSticker: View {
     var onToggle: () -> Void = {}
     /// Being dragged to a new place in the line.
     var lifted = false
+    /// Which colour and lean to wear; stays with the friend while they move.
+    var look = 0
 
     @State private var punch = false
 
@@ -247,10 +259,6 @@ private struct FriendSticker: View {
     }
 
     private var checked: Bool { selecting && isSelected }
-
-    /// Colour and lean belong to the friend, not the slot, so moving them along
-    /// the line never repaints anyone.
-    private var look: Int { Int(friend.id.uuid.0) }
 
     private var displayName: String {
         friend.name.isEmpty ? "Friend" : friend.name
