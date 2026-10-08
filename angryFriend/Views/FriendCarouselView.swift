@@ -41,6 +41,20 @@ struct FriendCarouselView: View {
     private var dragging: UUID? { lift?.id }
     private var dragTranslation: CGFloat { lift?.translation ?? 0 }
 
+    /// The slot the held sticker is hovering over.
+    private var dropIndex: Int {
+        max(0, min(friends.count - 1, dragStartIndex + Int((dragTranslation / pitch).rounded())))
+    }
+
+    /// How far a sticker that isn't being held steps aside to make room.
+    private func makeRoom(at index: Int) -> CGFloat {
+        guard dragging != nil else { return 0 }
+        let from = dragStartIndex, to = dropIndex
+        if to > from, index > from, index <= to { return -pitch }
+        if to < from, index >= to, index < from { return pitch }
+        return 0
+    }
+
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(alignment: .top, spacing: 16) {
@@ -59,10 +73,11 @@ struct FriendCarouselView: View {
                         onToggle: { selection?.onToggle(friend) },
                         lifted: lifted
                     )
-                    // The lifted sticker follows the finger; everyone else waits
-                    // until it's put down, then slides to the new order.
-                    .offset(x: lifted ? dragTranslation : 0)
+                    // The lifted sticker follows the finger; the others step aside
+                    // to show where it will land. The real order changes on drop.
+                    .offset(x: lifted ? dragTranslation : makeRoom(at: index))
                     .zIndex(lifted ? 10 : 0)
+                    .animation(lifted ? nil : .spring(response: 0.3, dampingFraction: 0.75), value: dropIndex)
                     .animation(.spring(response: 0.35, dampingFraction: 0.75), value: index)
                     .animation(.spring(response: 0.3, dampingFraction: 0.7), value: dragging == nil)
                     .gesture(reorderGesture(for: friend), including: selection == nil ? .all : .subviews)
