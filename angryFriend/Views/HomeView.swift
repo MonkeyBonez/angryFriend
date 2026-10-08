@@ -11,7 +11,7 @@ struct HomeView: View {
     @AppStorage(FriendRescanner.enabledKey) private var autoScan = true
     @AppStorage("hasSeenAddFriendTutorial") private var hasSeenTutorial = false
     @State private var tutorial: TutorialMode? = nil
-    @Query(sort: \Friend.createdAt, order: .reverse) private var savedFriends: [Friend]
+    @Query(sort: [SortDescriptor(\Friend.sortOrder), SortDescriptor(\Friend.createdAt, order: .reverse)]) private var savedFriends: [Friend]
 
     @State private var showMultiPicker = false
     @State private var permissionDenied = false
@@ -159,11 +159,11 @@ struct HomeView: View {
             FriendCarouselView(
                 friends: savedFriends,
                 onSelect: play,
-                onHold: viewAlbum,
                 onEdit: editFriend,
                 onAddNew: requestAndPick,
                 onDemo: playDemo,
-                selection: selecting ? FriendSelection(selected: selected, onToggle: toggle) : nil
+                selection: selecting ? FriendSelection(selected: selected, onToggle: toggle) : nil,
+                onReorder: reorder
             )
 
             if savedFriends.count >= 2 {
@@ -190,7 +190,7 @@ struct HomeView: View {
                 } label: {
                     Text("MULTIPLE SUSPECTS")
                 }
-                .buttonStyle(StickerButtonStyle(background: selecting ? StickerTheme.ink : .white,
+                .buttonStyle(StickerButtonStyle(background: selecting ? StickerTheme.mint : .white,
                                                 foreground: selecting ? .white : StickerTheme.ink,
                                                 size: 12, cornerRadius: 999, fullWidth: false))
                 .rotationEffect(.degrees(selecting ? 1.5 : -1.5))
@@ -397,6 +397,14 @@ struct HomeView: View {
         }
     }
 
+    /// Saves the line-up the user dragged into place.
+    private func reorder(_ order: [Friend]) {
+        for (i, friend) in order.enumerated() where friend.sortOrder != i {
+            friend.sortOrder = i
+        }
+        try? modelContext.save()
+    }
+
     private func toggle(_ friend: Friend) {
         if selected.contains(friend.id) {
             selected.remove(friend.id)
@@ -435,12 +443,6 @@ struct HomeView: View {
         appState.usedPhotoIDs = []
         appState.rescanner.ensureRunning()
         appState.screen = .processing
-    }
-
-    private func viewAlbum(_ friend: Friend) {
-        resetSelection()
-        appState.viewingFriend = friend
-        appState.screen = .album
     }
 
     private func editFriend(_ friend: Friend) {

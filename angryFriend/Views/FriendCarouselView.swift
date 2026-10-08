@@ -10,15 +10,28 @@ struct FriendSelection {
 
 /// The suspect line-up. Each friend is a die-cut sticker: white border, ink ring,
 /// hard shadow, leaning at a fixed angle so the row looks slapped together.
-/// With a `selection`, tapping checks friends instead of playing them.
+/// With a `selection`, tapping checks friends instead of playing them. Holding
+/// a sticker lifts it so it can be dragged to a new place in the line
+/// (`onReorder` gets the new order); New and the emoji pal stay where they are.
 struct FriendCarouselView: View {
     let friends: [Friend]
     let onSelect: (Friend) -> Void
-    let onHold: (Friend) -> Void
     let onEdit: (Friend) -> Void
     let onAddNew: () -> Void
     let onDemo: () -> Void
     var selection: FriendSelection? = nil
+    var onReorder: ([Friend]) -> Void = { _ in }
+
+    /// The order on screen while a sticker is being dragged; follows `friends` otherwise.
+    @State private var dragOrder: [Friend] = []
+    @State private var dragging: UUID? = nil
+    @State private var dragStartIndex = 0
+    @State private var dragTranslation: CGFloat = 0
+
+    /// One sticker's width plus the row's spacing: how far a drag moves one place.
+    private let pitch: CGFloat = 86 + 16
+
+    private var shown: [Friend] { dragging == nil ? friends : dragOrder }
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -26,17 +39,24 @@ struct FriendCarouselView: View {
                 AddStickerButton(isEnabled: selection == nil, action: onAddNew)
                     .popIn(delay: 0.05)
 
-                ForEach(Array(friends.enumerated()), id: \.element.id) { index, friend in
+                ForEach(Array(shown.enumerated()), id: \.element.id) { index, friend in
+                    let lifted = dragging == friend.id
                     FriendSticker(
                         friend: friend,
                         index: index,
                         onSelect: { onSelect(friend) },
-                        onHold: { onHold(friend) },
                         onEdit: { onEdit(friend) },
                         selecting: selection != nil,
                         isSelected: selection?.selected.contains(friend.id) ?? false,
-                        onToggle: { selection?.onToggle(friend) }
+                        onToggle: { selection?.onToggle(friend) },
+                        lifted: lifted
                     )
+                    // The lifted sticker follows the finger; the base position has
+                    // already moved by however many places it was shifted.
+                    .offset(x: lifted ? dragTranslation - CGFloat(index - dragStartIndex) * pitch : 0)
+                    .zIndex(lifted ? 10 : 0)
+                    .animation(lifted ? nil : .spring(response: 0.3, dampingFraction: 0.75), value: index)
+                    .highPriorityGesture(reorderGesture(for: friend), including: selection == nil ? .all : .subviews)
                     .popIn(delay: 0.1 + Double(index) * 0.06)
                 }
 
@@ -53,6 +73,48 @@ struct FriendCarouselView: View {
             .padding(.vertical, 10)
         }
         .scrollClipDisabled()
+        .scrollDisabled(dragging != nil)
+    }
+
+    /// Hold to lift, then drag along the row. Dropping saves the new order.
+    private func reorderGesture(for friend: Friend) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.35)
+            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .local))
+            .onChanged { value in
+                switch value {
+                case .first(true):
+                    guard dragging == nil, friends.count > 1 else { return }
+                    Haptics.press()
+                    dragOrder = friends
+                    dragStartIndex = friends.firstIndex { $0.id == friend.id } ?? 0
+                    dragTranslation = 0
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.6)) { dragging = friend.id }
+                case .second(true, let drag?):
+                    guard dragging == friend.id else { return }
+                    dragTranslation = drag.translation.width
+                    let wanted = max(0, min(dragOrder.count - 1, dragStartIndex + Int((drag.translation.width / pitch).rounded())))
+                    if let current = dragOrder.firstIndex(where: { $0.id == friend.id }), current != wanted {
+                        Haptics.flick()
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+                            dragOrder.move(fromOffsets: IndexSet(integer: current), toOffset: wanted > current ? wanted + 1 : wanted)
+                        }
+                    }
+                default:
+                    break
+                }
+            }
+            .onEnded { _ in
+                guard dragging == friend.id else { return }
+                let order = dragOrder
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                    dragTranslation = 0
+                    dragging = nil
+                }
+                if order.map(\.id) != friends.map(\.id) {
+                    Haptics.done()
+                    onReorder(order)
+                }
+            }
     }
 }
 
@@ -62,11 +124,12 @@ private struct FriendSticker: View {
     let friend: Friend
     let index: Int
     let onSelect: () -> Void
-    let onHold: () -> Void
     let onEdit: () -> Void
     var selecting = false
     var isSelected = false
     var onToggle: () -> Void = {}
+    /// Being dragged to a new place in the line.
+    var lifted = false
 
     @State private var punch = false
 
@@ -106,11 +169,6 @@ private struct FriendSticker: View {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.5).delay(0.12)) { punch = false }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { onSelect() }
                 }
-                .onLongPressGesture(minimumDuration: 0.4) {
-                    guard !selecting else { return }
-                    Haptics.press()
-                    onHold()
-                }
 
                 if selecting {
                     if isSelected {
@@ -148,14 +206,18 @@ private struct FriendSticker: View {
                       foreground: checked ? .white : StickerTheme.ink)
         }
         .frame(width: size + 8)
+        .scaleEffect(lifted ? 1.12 : 1)
+        .rotationEffect(.degrees(lifted ? 3 : 0))
         .opacity(selecting && !isSelected ? 0.45 : 1)
+        .shadow(color: StickerTheme.ink.opacity(lifted ? 0.3 : 0), radius: lifted ? 10 : 0, y: lifted ? 8 : 0)
         .animation(.spring(response: 0.25, dampingFraction: 0.65), value: isSelected)
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: selecting)
+        .animation(.spring(response: 0.25, dampingFraction: 0.6), value: lifted)
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(checked ? [.isSelected] : [])
         .accessibilityHint(selecting
             ? (isSelected ? "Tap to leave them out" : "Tap to add them to the round")
-            : "Tap to play, press and hold to open their album")
+            : "Tap to play, press and hold to move them along the line")
     }
 
     private var checked: Bool { selecting && isSelected }
