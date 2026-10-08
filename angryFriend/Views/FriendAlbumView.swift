@@ -112,7 +112,7 @@ private struct FriendAlbumContent: View {
             Button("Just remove from the game") { removeSelected(notThem: false) }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("“Not \(displayName)” also teaches the app to skip that face from now on. Either way, the photos stay in your library.")
+            Text("“Not \(displayName)” also removes any other photos here where the face looks more like \(selectedIDs.count == 1 ? "this person" : "these people") than like \(displayName), and stops adding them. Either way, the photos stay in your library.")
         }
         .alert("Add Photos", isPresented: Binding(
             get: { addStatusMessage != nil },
