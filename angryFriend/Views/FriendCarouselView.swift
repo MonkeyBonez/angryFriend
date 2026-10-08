@@ -30,16 +30,16 @@ struct FriendCarouselView: View {
         var translation: CGFloat
     }
     @GestureState private var lift: Lift? = nil
-    /// The order on screen while a sticker is being dragged; follows `friends` otherwise.
-    @State private var dragOrder: [Friend] = []
+    /// Where the held sticker started and how far it had gone when the finger
+    /// lifted; the line only reorders at that point, not while dragging.
     @State private var dragStartIndex = 0
+    @State private var lastTranslation: CGFloat = 0
 
     /// One sticker's width plus the row's spacing: how far a drag moves one place.
     private let pitch: CGFloat = 86 + 16
 
     private var dragging: UUID? { lift?.id }
     private var dragTranslation: CGFloat { lift?.translation ?? 0 }
-    private var shown: [Friend] { dragging == nil || dragOrder.count != friends.count ? friends : dragOrder }
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -47,7 +47,7 @@ struct FriendCarouselView: View {
                 AddStickerButton(isEnabled: selection == nil, action: onAddNew)
                     .popIn(delay: 0.05)
 
-                ForEach(Array(shown.enumerated()), id: \.element.id) { index, friend in
+                ForEach(Array(friends.enumerated()), id: \.element.id) { index, friend in
                     let lifted = dragging == friend.id
                     FriendSticker(
                         friend: friend,
@@ -59,11 +59,11 @@ struct FriendCarouselView: View {
                         onToggle: { selection?.onToggle(friend) },
                         lifted: lifted
                     )
-                    // The lifted sticker follows the finger; the base position has
-                    // already moved by however many places it was shifted.
-                    .offset(x: lifted ? dragTranslation - CGFloat(index - dragStartIndex) * pitch : 0)
+                    // The lifted sticker follows the finger; everyone else waits
+                    // until it's put down, then slides to the new order.
+                    .offset(x: lifted ? dragTranslation : 0)
                     .zIndex(lifted ? 10 : 0)
-                    .animation(lifted ? nil : .spring(response: 0.3, dampingFraction: 0.75), value: index)
+                    .animation(.spring(response: 0.35, dampingFraction: 0.75), value: index)
                     .animation(.spring(response: 0.3, dampingFraction: 0.7), value: dragging == nil)
                     .gesture(reorderGesture(for: friend), including: selection == nil ? .all : .subviews)
                     .popIn(delay: 0.1 + Double(index) * 0.06)
@@ -83,10 +83,15 @@ struct FriendCarouselView: View {
         }
         .scrollClipDisabled()
         .onChange(of: lift == nil) { _, released in
-            // Dropped (or cancelled): keep whatever order was on screen.
-            guard released, dragOrder.count == friends.count, dragOrder.map(\.id) != friends.map(\.id) else { return }
+            // Put down: move it to the place it was dropped over.
+            guard released, friends.count > 1, dragStartIndex < friends.count else { return }
+            let wanted = max(0, min(friends.count - 1, dragStartIndex + Int((lastTranslation / pitch).rounded())))
+            lastTranslation = 0
+            guard wanted != dragStartIndex else { return }
+            var order = friends
+            order.move(fromOffsets: IndexSet(integer: dragStartIndex), toOffset: wanted > dragStartIndex ? wanted + 1 : wanted)
             Haptics.done()
-            onReorder(dragOrder)
+            onReorder(order)
         }
     }
 
@@ -110,17 +115,13 @@ struct FriendCarouselView: View {
                 case .first(true):
                     guard friends.count > 1 else { return }
                     Haptics.press()
-                    dragOrder = friends
                     dragStartIndex = friends.firstIndex { $0.id == friend.id } ?? 0
+                    lastTranslation = 0
                 case .second(true, let drag?):
-                    guard dragging == friend.id, !dragOrder.isEmpty else { return }
-                    let wanted = max(0, min(dragOrder.count - 1, dragStartIndex + Int((drag.translation.width / pitch).rounded())))
-                    if let current = dragOrder.firstIndex(where: { $0.id == friend.id }), current != wanted {
-                        Haptics.flick()
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
-                            dragOrder.move(fromOffsets: IndexSet(integer: current), toOffset: wanted > current ? wanted + 1 : wanted)
-                        }
-                    }
+                    guard dragging == friend.id else { return }
+                    let before = Int((lastTranslation / pitch).rounded())
+                    lastTranslation = drag.translation.width
+                    if Int((lastTranslation / pitch).rounded()) != before { Haptics.flick() }
                 default:
                     break
                 }
@@ -160,12 +161,12 @@ private struct FriendSticker: View {
                     }
                 }
                 .frame(width: size, height: size)
-                .background(StickerTheme.tile(index))
+                .background(StickerTheme.tile(look))
                 .clipShape(Circle())
                 .overlay(Circle().stroke(.white, lineWidth: 3.5))
                 .overlay(Circle().stroke(StickerTheme.ink, lineWidth: checked ? 4 : 2).padding(-3.5))
                 .hardShadow(StickerTheme.ink.opacity(0.35), x: 3, y: 4)
-                .rotationEffect(.degrees(StickerTheme.lean(index)))
+                .rotationEffect(.degrees(StickerTheme.lean(look)))
                 .scaleEffect(punch ? 0.86 : (checked ? 1.06 : 1))
                 .contentShape(Circle())
                 .onTapGesture {
@@ -211,7 +212,7 @@ private struct FriendSticker: View {
                 }
             }
 
-            TapeLabel(text: displayName, tilt: StickerTheme.lean(index + 3),
+            TapeLabel(text: displayName, tilt: StickerTheme.lean(look + 3),
                       background: checked ? StickerTheme.ink : .white,
                       foreground: checked ? .white : StickerTheme.ink)
         }
@@ -231,6 +232,10 @@ private struct FriendSticker: View {
     }
 
     private var checked: Bool { selecting && isSelected }
+
+    /// Colour and lean belong to the friend, not the slot, so moving them along
+    /// the line never repaints anyone.
+    private var look: Int { Int(friend.id.uuid.0) }
 
     private var displayName: String {
         friend.name.isEmpty ? "Friend" : friend.name
