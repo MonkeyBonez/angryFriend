@@ -51,6 +51,13 @@ private struct FriendAlbumContent: View {
                               tilt: -1.5, size: 11.5,
                               background: StickerTheme.pink, foreground: .white)
                         .padding(.bottom, 8)
+                } else if isTidying, selectedIDs.isEmpty {
+                    // After a "Not them": the scan is clearing that person's other photos.
+                    TapeLabel(text: "TIDYING THE ALBUM…",
+                              tilt: -1.5, size: 11.5,
+                              background: StickerTheme.ink, foreground: .white)
+                        .padding(.bottom, 8)
+                        .transition(.scale(scale: 0.8).combined(with: .opacity))
                 } else if !selectedIDs.isEmpty {
                     TapeLabel(text: "\(selectedIDs.count) SELECTED",
                               tilt: 1.5, size: 11.5,
@@ -83,6 +90,14 @@ private struct FriendAlbumContent: View {
         }
         .onAppear { Haptics.warmUp() }
         .task { loadAssets() }
+        // The scan can change the album while it's open — a "Not them" re-check
+        // dropping that person's other photos, or the library walk adding new
+        // ones — so the grid follows it live.
+        .onChange(of: friend.photoMatches.map(\.assetID)) { _, ids in
+            let current = Set(ids)
+            selectedIDs.formIntersection(current)
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) { loadAssets() }
+        }
         .sheet(isPresented: $showAddPicker) {
             MultiImagePicker { identifiers in
                 addPhotos(identifiers)
@@ -191,6 +206,12 @@ private struct FriendAlbumContent: View {
 
     private var displayName: String {
         friend.name.isEmpty ? "Friend" : friend.name
+    }
+
+    /// The background scan is re-checking this album right now.
+    private var isTidying: Bool {
+        if case .tidying(let name) = appState.rescanner.phase { return name == friend.name }
+        return false
     }
 
     // MARK: - Actions
